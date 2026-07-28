@@ -1,0 +1,20 @@
+{
+  "name": "SensESP Wyoming Satellite",
+  "version": "0.1.0",
+  "description": "Wyoming-protocol voice satellite for SensESP — a TCP server that lets a signalk-wyoming / Home Assistant orchestrator play TTS to and stream mic audio from an ESP32 board's audio codec",
+  "keywords": "wyoming, voice, satellite, tts, stt, signalk, home-assistant, audio, es8311, esp32-p4, sensesp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dirkwa/sensesp-wyoming-satellite.git"
+  },
+  "license": "MIT",
+  "frameworks": ["arduino", "espidf"],
+  "platforms": ["espressif32"],
+  "dependencies": {
+    "SignalK/SensESP": ">=3.3.0"
+  },
+  "build": {
+    "srcFilter": ["+<*>"],
+    "includeDir": "src"
+  }
+}
