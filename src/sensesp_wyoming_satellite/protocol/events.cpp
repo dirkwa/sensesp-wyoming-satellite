@@ -60,6 +60,59 @@ void build_pong(std::vector<uint8_t>& out, const std::string& text) {
 
 void build_played(std::vector<uint8_t>& out) { encode_event(out, "played"); }
 
+void build_run_pipeline(std::vector<uint8_t>& out, const std::string& name) {
+  // asr..tts: transcribe our mic audio and (if a reply is synthesised) play
+  // it back. The orchestrator segments/endpoints the utterance itself.
+  JsonDocument doc;
+  doc["start_stage"] = "asr";
+  doc["end_stage"] = "tts";
+  doc["restart_on_end"] = false;
+  if (!name.empty()) doc["name"] = name;
+  std::string data_json;
+  serializeJson(doc, data_json);
+  encode_event(out, "run-pipeline", data_json, nullptr, 0);
+}
+
+namespace {
+std::string audio_format_json(const AudioFormat& fmt, uint32_t timestamp_ms,
+                              bool with_ts) {
+  JsonDocument doc;
+  doc["rate"] = fmt.rate;
+  doc["width"] = fmt.width;
+  doc["channels"] = fmt.channels;
+  if (with_ts) doc["timestamp"] = timestamp_ms;
+  std::string s;
+  serializeJson(doc, s);
+  return s;
+}
+}  // namespace
+
+void build_audio_start(std::vector<uint8_t>& out, const AudioFormat& fmt) {
+  encode_event(out, "audio-start", audio_format_json(fmt, 0, false), nullptr,
+               0);
+}
+
+void build_audio_chunk(std::vector<uint8_t>& out, const AudioFormat& fmt,
+                       const int16_t* samples, size_t frames) {
+  const uint8_t* payload = reinterpret_cast<const uint8_t*>(samples);
+  encode_event(out, "audio-chunk", audio_format_json(fmt, 0, false), payload,
+               frames * sizeof(int16_t));
+}
+
+void build_audio_stop(std::vector<uint8_t>& out) {
+  encode_event(out, "audio-stop");
+}
+
+bool parse_transcript(const DecodedEvent& ev, std::string* text) {
+  if (ev.type != "transcript" || ev.data_json.empty()) return false;
+  JsonDocument doc;
+  if (deserializeJson(doc, ev.data_json)) return false;
+  const char* t = doc["text"];
+  if (!t) return false;
+  *text = t;
+  return true;
+}
+
 bool parse_audio_start(const DecodedEvent& ev, AudioFormat* out) {
   if (ev.type != "audio-start" || ev.data_json.empty()) return false;
   JsonDocument doc;

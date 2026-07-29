@@ -1,6 +1,8 @@
 #include "sensesp_wyoming_satellite/wyoming_satellite.h"
 
 #include <cerrno>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "esp_log.h"
@@ -15,9 +17,14 @@ constexpr const char* kTag = "wyoming_sat";
 WyomingSatellite::WyomingSatellite(
     sensesp_cockpit_display::AudioDriver* audio,
     const WyomingSatelliteConfig& config)
-    : audio_(audio), config_(config) {}
+    : audio_(audio), config_(config) {
+  send_mutex_ = xSemaphoreCreateMutex();
+}
 
-WyomingSatellite::~WyomingSatellite() { stop(); }
+WyomingSatellite::~WyomingSatellite() {
+  stop();
+  if (send_mutex_) vSemaphoreDelete(send_mutex_);
+}
 
 void WyomingSatellite::start() {
   if (running_.exchange(true)) return;
@@ -105,6 +112,10 @@ void WyomingSatellite::handle_client(int sock) {
   client_sock_ = sock;
   client_connected_.store(true);
   streaming_ = false;
+  armed_ = false;
+  listening_.store(false);
+  ptt_pending_.store(false);
+  set_state(SatState::Idle);
 
   // Short read timeout so an inbound ping is answered well within the 5s
   // deadline even when nothing else is arriving.
@@ -117,6 +128,30 @@ void WyomingSatellite::handle_client(int sock) {
   uint8_t recv_buf[1600];
 
   while (running_.load()) {
+    // A push-to-talk request arrives asynchronously (UI task). Start the mic
+    // stream here on the satellite task so all socket writes stay serialised.
+    if (ptt_pending_.exchange(false)) {
+      if (armed_ && !listening_.load() && !streaming_) {
+        std::vector<uint8_t> rp;
+        build_run_pipeline(rp, config_.name);
+        if (send_all(rp)) {
+          listening_.store(true);
+          set_state(SatState::Listening);
+          if (xTaskCreate(&WyomingSatellite::mic_task, "wyoming_mic", 4096,
+                          this, 4, &mic_task_) != pdPASS) {
+            ESP_LOGW(kTag, "mic task create failed");
+            listening_.store(false);
+            set_state(SatState::Idle);
+          } else {
+            ESP_LOGI(kTag, "PTT: listening");
+          }
+        }
+      } else {
+        ESP_LOGW(kTag, "PTT ignored (armed=%d listening=%d speaking=%d)",
+                 armed_, (int)listening_.load(), (int)streaming_);
+      }
+    }
+
     int n = recv(sock, recv_buf, sizeof(recv_buf), 0);
     if (n > 0) {
       if (!decoder.feed(recv_buf, (size_t)n, &WyomingSatellite::on_event_tramp,
@@ -131,7 +166,13 @@ void WyomingSatellite::handle_client(int sock) {
     }
   }
 
-  // Guarantee the codec mutex is released if we die mid-utterance.
+  // Stop the mic task and release the playback codec if we die mid-action.
+  listening_.store(false);
+  if (mic_task_) {
+    // run_mic exits when listening_ is false; give it a tick to finish its
+    // current record/stop, then reclaim the handle.
+    for (int i = 0; i < 20 && mic_task_; ++i) vTaskDelay(pdMS_TO_TICKS(10));
+  }
   if (streaming_) {
     audio_->end_stream();
     streaming_ = false;
@@ -139,6 +180,7 @@ void WyomingSatellite::handle_client(int sock) {
   close(sock);
   client_sock_ = -1;
   client_connected_.store(false);
+  set_state(SatState::Disconnected);
 }
 
 bool WyomingSatellite::on_event_tramp(void* ctx, const DecodedEvent& ev) {
@@ -164,11 +206,17 @@ bool WyomingSatellite::on_event(const DecodedEvent& ev) {
     return send_all(out);
   }
 
-  if (t == "run-satellite" || t == "pause-satellite") {
-    // Output-only Phase 1: nothing to arm. We already play whatever is
-    // streamed regardless of run/pause (upstream routes audio-* to snd
-    // unconditionally). Just acknowledge by continuing.
-    ESP_LOGI(kTag, "%s", t.c_str());
+  if (t == "run-satellite") {
+    // Armed: push-to-talk voice-in is now allowed. Playback works either way.
+    armed_ = true;
+    ESP_LOGI(kTag, "run-satellite (armed for voice-in)");
+    return true;
+  }
+  if (t == "pause-satellite") {
+    // Output-only: keep mic off the wire. Playback still works.
+    armed_ = false;
+    listening_.store(false);
+    ESP_LOGI(kTag, "pause-satellite (output only)");
     return true;
   }
 
@@ -212,12 +260,110 @@ bool WyomingSatellite::on_event(const DecodedEvent& ev) {
     return send_all(out);
   }
 
-  // transcript / detection / everything else: ignored in Phase 1
-  // (forward-compatible — unknown events are not errors).
+  if (t == "transcript") {
+    std::string text;
+    if (parse_transcript(ev, &text)) {
+      // End of the utterance: stop streaming mic audio, play the done sound,
+      // surface the text to the UI. The orchestrator publishes it to
+      // SignalK's voice.command — we don't.
+      listening_.store(false);
+      set_state(SatState::Idle);
+      ESP_LOGI(kTag, "transcript: \"%s\"", text.c_str());
+      play_done_tone();
+      if (transcript_cb_) transcript_cb_(transcript_ctx_, text.c_str());
+    }
+    return true;
+  }
+
+  // detection / everything else: ignored (forward-compatible — unknown
+  // events are not errors).
   return true;
 }
 
+void WyomingSatellite::trigger_ptt() {
+  // Called from any task (e.g. the LVGL UI). The satellite task picks this
+  // up between recvs and starts the stream, so socket writes stay on one
+  // task. Cheap and lock-free.
+  if (!client_connected_.load()) return;
+  ptt_pending_.store(true);
+}
+
+void WyomingSatellite::mic_task(void* arg) {
+  static_cast<WyomingSatellite*>(arg)->run_mic();
+  vTaskDelete(nullptr);
+}
+
+void WyomingSatellite::run_mic() {
+  // Stream mic audio as audio-start / audio-chunk* / audio-stop while
+  // listening_. The orchestrator endpoints the utterance and replies with a
+  // transcript, which clears listening_. A safety cap bounds a stuck stream.
+  const AudioFormat mic_fmt = {audio_->capture_rate(), 2, 1};
+  const size_t kChunkFrames = 512;  // 32 ms at 16 kHz
+  int16_t* buf = (int16_t*)malloc(kChunkFrames * sizeof(int16_t));
+  if (!buf) {
+    listening_.store(false);
+    mic_task_ = nullptr;
+    return;
+  }
+
+  audio_->start_capture();
+  {
+    std::vector<uint8_t> start;
+    build_audio_start(start, mic_fmt);
+    send_all(start);
+  }
+
+  // The orchestrator's endpointer ends the utterance on ~800 ms of silence
+  // (its maxUtteranceMs is 10 s). This cap is only a backstop for a stuck
+  // stream, so keep it just above the orchestrator's own max.
+  const TickType_t t0 = xTaskGetTickCount();
+  const TickType_t kMaxTicks = pdMS_TO_TICKS(12000);
+  while (listening_.load() && running_.load() && client_connected_.load()) {
+    if (xTaskGetTickCount() - t0 > kMaxTicks) {
+      ESP_LOGW(kTag, "mic stream hit safety cap — stopping");
+      break;
+    }
+    size_t frames = audio_->record_pcm(buf, kChunkFrames);
+    if (frames == 0) continue;
+    std::vector<uint8_t> chunk;
+    build_audio_chunk(chunk, mic_fmt, buf, frames);
+    if (!send_all(chunk)) break;
+  }
+
+  {
+    std::vector<uint8_t> stop;
+    build_audio_stop(stop);
+    send_all(stop);
+  }
+  audio_->stop_capture();
+  free(buf);
+  listening_.store(false);
+  mic_task_ = nullptr;
+}
+
+void WyomingSatellite::play_done_tone() {
+  // Short confirmation blip so the user knows the utterance was captured.
+  const uint32_t rate = 16000;
+  const size_t n = rate / 10;  // 100 ms
+  int16_t* pcm = (int16_t*)malloc(n * sizeof(int16_t));
+  if (!pcm) return;
+  for (size_t i = 0; i < n; ++i) {
+    float env = 1.0f;
+    size_t fade = n / 10;
+    if (i < fade) env = (float)i / fade;
+    else if (i >= n - fade) env = (float)(n - i) / fade;
+    pcm[i] = (int16_t)(0.4f * 32767.0f * env *
+                       sinf(2.0f * 3.14159265f * 880.0f * i / rate));
+  }
+  audio_->play_pcm(pcm, n);
+  free(pcm);
+}
+
 bool WyomingSatellite::send_all(const std::vector<uint8_t>& bytes) {
+  // Serialise writes: the mic task, the recv loop (pong / played / info) and
+  // PTT all send on one socket.
+  if (send_mutex_) xSemaphoreTake(send_mutex_, portMAX_DELAY);
+  bool ok = true;
   size_t off = 0;
   while (off < bytes.size()) {
     int sent = send(client_sock_, bytes.data() + off, bytes.size() - off,
@@ -230,11 +376,13 @@ bool WyomingSatellite::send_all(const std::vector<uint8_t>& bytes) {
         continue;
       }
       ESP_LOGW(kTag, "send failed: %d", errno);
-      return false;
+      ok = false;
+      break;
     }
     off += (size_t)sent;
   }
-  return true;
+  if (send_mutex_) xSemaphoreGive(send_mutex_);
+  return ok;
 }
 
 }  // namespace sensesp_wyoming
