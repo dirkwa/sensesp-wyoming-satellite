@@ -12,11 +12,11 @@
 // `audio-chunk` / `audio-stop`; we play it through the AudioDriver and reply
 // `played`.
 //
-// INPUT (the boat listens, push-to-talk): trigger_ptt() sends `detection` +
-// `run-pipeline` and streams the mic as `audio-chunk`s; the orchestrator
-// endpoints the utterance, runs ASR, and returns a `transcript`, which stops
-// our streaming and plays a done sound. The orchestrator publishes the text
-// to SignalK's voice.command — the panel itself is a dumb mic pump.
+// INPUT (the boat listens, push-to-talk): trigger_ptt() sends `run-pipeline`
+// and streams the mic as `audio-start` / `audio-chunk` / `audio-stop`; the
+// orchestrator endpoints the utterance, runs ASR, and returns a `transcript`,
+// which stops our streaming and plays a done sound. The orchestrator publishes
+// the text to SignalK's voice.command — the panel itself is a dumb mic pump.
 //
 // Single-client by design (a satellite mic is an open channel — one owner
 // at a time, the security model wyoming relies on). A second connection is
@@ -94,6 +94,7 @@ class WyomingSatellite {
   WyomingSatelliteConfig config_;
 
   TaskHandle_t server_task_ = nullptr;
+  SemaphoreHandle_t server_done_ = nullptr;  // given when serve() exits
   std::atomic<bool> running_{false};
   std::atomic<bool> client_connected_{false};
   std::atomic<SatState> state_{SatState::Disconnected};
@@ -106,8 +107,9 @@ class WyomingSatellite {
   AudioFormat play_fmt_;
 
   // Voice-in (push-to-talk).
-  TaskHandle_t mic_task_ = nullptr;
-  std::atomic<bool> listening_{false};  // mic task should stream
+  std::atomic<bool> mic_running_{false};  // mic task alive (set by the task)
+  SemaphoreHandle_t mic_done_ = nullptr;  // given when run_mic() exits
+  std::atomic<bool> listening_{false};    // mic task should stream
   std::atomic<bool> ptt_pending_{false};
 
   TranscriptFn transcript_cb_ = nullptr;

@@ -19,11 +19,15 @@ WyomingSatellite::WyomingSatellite(
     const WyomingSatelliteConfig& config)
     : audio_(audio), config_(config) {
   send_mutex_ = xSemaphoreCreateMutex();
+  mic_done_ = xSemaphoreCreateBinary();
+  server_done_ = xSemaphoreCreateBinary();
 }
 
 WyomingSatellite::~WyomingSatellite() {
-  stop();
+  stop();  // joins the server (and transitively the mic) task before freeing
   if (send_mutex_) vSemaphoreDelete(send_mutex_);
+  if (mic_done_) vSemaphoreDelete(mic_done_);
+  if (server_done_) vSemaphoreDelete(server_done_);
 }
 
 void WyomingSatellite::start() {
@@ -41,14 +45,24 @@ void WyomingSatellite::stop() {
     shutdown(client_sock_, SHUT_RDWR);
   }
   if (server_task_) {
-    // The task exits on its next select/recv tick (≤1s accept, ≤500ms recv).
-    vTaskDelay(pdMS_TO_TICKS(1200));
+    // Real join: serve() gives server_done_ just before the task self-deletes
+    // (having already joined the mic task). Wait for it so the caller /
+    // destructor never frees a semaphore a running task still touches. The
+    // task exits on its next select/recv tick (≤1s accept, ≤500ms recv) plus
+    // mic-task drain, so a few seconds is ample.
+    if (xSemaphoreTake(server_done_, pdMS_TO_TICKS(8000)) != pdTRUE) {
+      ESP_LOGE(kTag, "server task did not exit in time — leaking task handle");
+    }
     server_task_ = nullptr;
   }
 }
 
 void WyomingSatellite::server_task(void* arg) {
-  static_cast<WyomingSatellite*>(arg)->serve();
+  auto* self = static_cast<WyomingSatellite*>(arg);
+  self->serve();
+  // Signal stop() that the task (and any mic task it joined) is fully done
+  // before self-deleting, so teardown can safely free shared primitives.
+  xSemaphoreGive(self->server_done_);
   vTaskDelete(nullptr);
 }
 
@@ -137,14 +151,22 @@ void WyomingSatellite::handle_client(int sock) {
         if (send_all(rp)) {
           listening_.store(true);
           set_state(SatState::Listening);
+          TaskHandle_t t = nullptr;
           if (xTaskCreate(&WyomingSatellite::mic_task, "wyoming_mic", 4096,
-                          this, 4, &mic_task_) != pdPASS) {
-            ESP_LOGW(kTag, "mic task create failed");
+                          this, 4, &t) != pdPASS) {
+            // The orchestrator was told a pipeline is running; close it out
+            // with audio-stop so it isn't left waiting on its own timeout.
+            ESP_LOGW(kTag, "mic task create failed — sending audio-stop");
             listening_.store(false);
             set_state(SatState::Idle);
+            std::vector<uint8_t> stop;
+            build_audio_stop(stop);
+            send_all(stop);
           } else {
             ESP_LOGI(kTag, "PTT: listening");
           }
+        } else {
+          ESP_LOGW(kTag, "PTT: run-pipeline send failed");
         }
       } else {
         ESP_LOGW(kTag, "PTT ignored (armed=%d listening=%d speaking=%d)",
@@ -166,12 +188,18 @@ void WyomingSatellite::handle_client(int sock) {
     }
   }
 
-  // Stop the mic task and release the playback codec if we die mid-action.
+  // Stop the mic task and JOIN it before closing the socket. Signalling
+  // listening_=false makes run_mic() exit its loop; mic_done_ is given when it
+  // has fully returned (past its final send_all + stop_capture). Closing the
+  // socket while the mic task could still be mid-send would let its
+  // audio-chunk writes race the close — or, worse, land on the next client's
+  // socket. Waiting here (same task that would accept the next client)
+  // guarantees the mic task is done first.
   listening_.store(false);
-  if (mic_task_) {
-    // run_mic exits when listening_ is false; give it a tick to finish its
-    // current record/stop, then reclaim the handle.
-    for (int i = 0; i < 20 && mic_task_; ++i) vTaskDelay(pdMS_TO_TICKS(10));
+  if (mic_running_.load()) {
+    if (xSemaphoreTake(mic_done_, pdMS_TO_TICKS(3000)) != pdTRUE) {
+      ESP_LOGE(kTag, "mic task did not finish — closing socket anyway");
+    }
   }
   if (streaming_) {
     audio_->end_stream();
@@ -233,6 +261,9 @@ bool WyomingSatellite::on_event(const DecodedEvent& ev) {
       streaming_ = false;
     } else {
       streaming_ = true;
+      // Reflect TTS playback in the UI-facing state (unless a voice-in
+      // pipeline is mid-flight — don't stomp Listening).
+      if (state() != SatState::Listening) set_state(SatState::Speaking);
       ESP_LOGI(kTag, "audio-start %lu Hz", (unsigned long)fmt.rate);
     }
     return true;
@@ -253,6 +284,9 @@ bool WyomingSatellite::on_event(const DecodedEvent& ev) {
     if (streaming_) {
       audio_->end_stream();
       streaming_ = false;
+      // Leave Listening alone (a pipeline may be mid-flight); otherwise
+      // playback is done, so go back to Idle.
+      if (state() == SatState::Speaking) set_state(SatState::Idle);
     }
     std::vector<uint8_t> out;
     build_played(out);
@@ -297,12 +331,26 @@ void WyomingSatellite::run_mic() {
   // Stream mic audio as audio-start / audio-chunk* / audio-stop while
   // listening_. The orchestrator endpoints the utterance and replies with a
   // transcript, which clears listening_. A safety cap bounds a stuck stream.
+  //
+  // EVERY exit path must: clear listening_, return the state to Idle (only the
+  // transcript handler otherwise resets it, so a cap/send-fail/disconnect exit
+  // would leave the UI stuck on Listening), and give mic_done_ (the join that
+  // handle_client() waits on before closing the socket). mic_running_ gates
+  // that wait so a never-started task doesn't hang it.
+  mic_running_.store(true);
   const AudioFormat mic_fmt = {audio_->capture_rate(), 2, 1};
   const size_t kChunkFrames = 512;  // 32 ms at 16 kHz
   int16_t* buf = (int16_t*)malloc(kChunkFrames * sizeof(int16_t));
   if (!buf) {
+    // No audio-start was sent, so send a bare audio-stop to close the pipeline
+    // the run-pipeline opened.
+    std::vector<uint8_t> stop;
+    build_audio_stop(stop);
+    send_all(stop);
     listening_.store(false);
-    mic_task_ = nullptr;
+    set_state(SatState::Idle);
+    mic_running_.store(false);
+    xSemaphoreGive(mic_done_);
     return;
   }
 
@@ -338,7 +386,9 @@ void WyomingSatellite::run_mic() {
   audio_->stop_capture();
   free(buf);
   listening_.store(false);
-  mic_task_ = nullptr;
+  set_state(SatState::Idle);
+  mic_running_.store(false);
+  xSemaphoreGive(mic_done_);
 }
 
 void WyomingSatellite::play_done_tone() {
