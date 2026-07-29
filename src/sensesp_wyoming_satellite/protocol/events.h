@@ -44,7 +44,22 @@ void build_pong(std::vector<uint8_t>& out, const std::string& text);
 // `played` — playback of an audio-start..audio-stop span finished.
 void build_played(std::vector<uint8_t>& out);
 
+// ---- Voice-in (push-to-talk) builders ------------------------------------
+
+// `run-pipeline` — ask the orchestrator to run asr..tts on the audio we're
+// about to stream. `name` identifies this satellite.
+void build_run_pipeline(std::vector<uint8_t>& out, const std::string& name);
+
+// `audio-start` / `audio-chunk` / `audio-stop` for the OUTBOUND mic stream.
+void build_audio_start(std::vector<uint8_t>& out, const AudioFormat& fmt);
+void build_audio_chunk(std::vector<uint8_t>& out, const AudioFormat& fmt,
+                       const int16_t* samples, size_t frames);
+void build_audio_stop(std::vector<uint8_t>& out);
+
 // ---- Parsers: pull the fields we need from a DecodedEvent ----------------
+
+// Parse a `transcript` event's text. Returns false if not a transcript.
+bool parse_transcript(const DecodedEvent& ev, std::string* text);
 
 // Parse an audio-start's format. Returns false if the event isn't
 // audio-start or the format is unusable.
