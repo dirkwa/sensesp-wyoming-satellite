@@ -21,8 +21,19 @@
 // Single-client by design (a satellite mic is an open channel — one owner
 // at a time, the security model wyoming relies on). A second connection is
 // closed immediately.
+//
+// WAKE MODE (optional, config.wake_host set): a SECOND, OUTBOUND connection
+// to a wake service (openWakeWord :10400). The satellite streams the mic to
+// it continuously and, on `detection`, starts the same pipeline PTT does —
+// hands-free. The mic has exactly ONE consumer at all times: the wake loop
+// captures while idle and PAUSES itself for the duration of a pipeline
+// stream (whether triggered by a detection or a PTT press), so run_mic() and
+// the wake loop never call record_pcm() concurrently.
 
 #include <atomic>
+#include <functional>
+#include <string>
+#include <vector>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -40,6 +51,16 @@ struct WyomingSatelliteConfig {
   // voices are 22050 Hz; the driver reopens the codec to match. Set to
   // 16000 if you constrain the orchestrator to 16 kHz voices.
   uint32_t snd_rate = 22050;
+
+  // --- Hands-free wake word (optional; empty host = disabled) --------------
+  // When wake_host is set, the satellite opens a SECOND, outbound connection
+  // to a Wyoming wake service (openWakeWord, default :10400), streams the mic
+  // to it continuously, and on `detection` runs a pipeline toward the
+  // orchestrator exactly as a push-to-talk press would. No button needed.
+  std::string wake_host;              // e.g. the SK server host; "" = off
+  uint16_t wake_port = 10400;         // wyoming-openwakeword default
+  std::vector<std::string> wake_words;  // empty = listen for any word
+  bool awake_cue = true;              // play a short blip on detection
 };
 
 // Coarse state for a UI indicator.
@@ -81,6 +102,13 @@ class WyomingSatellite {
     transcript_ctx_ = ctx;
   }
 
+  // Optional privacy gate: return true to suppress the mic (wake streaming
+  // AND push-to-talk). The panel's mic-mute switch wires this. When it
+  // returns true the wake loop stops sending audio to the wake service and a
+  // PTT press is ignored. Null = never muted. Called from the wake/socket
+  // tasks; must be cheap and non-blocking.
+  void set_mic_muted_fn(std::function<bool()> fn) { mic_muted_fn_ = std::move(fn); }
+
  private:
   static void server_task(void* arg);
   void serve();                  // accept loop
@@ -88,6 +116,19 @@ class WyomingSatellite {
 
   static void mic_task(void* arg);
   void run_mic();  // streams audio-chunk while listening_
+
+  // Wake mode: an outbound client to the wake service. Reconnect loop + the
+  // continuous capture that feeds it while idle.
+  static void wake_task(void* arg);
+  void run_wake();                     // connect/reconnect loop
+  bool wake_session(int sock);         // one wake-service connection's life
+  bool mic_muted() const {             // consult the privacy gate
+    return mic_muted_fn_ && mic_muted_fn_();
+  }
+  // Request + await a pipeline toward the orchestrator (used by a detection).
+  // Sets ptt_held_ so the socket task starts run_mic(); waits for that stream
+  // to finish so the wake loop can resume capture as the sole mic consumer.
+  void run_detection_pipeline();
 
   static bool on_event_tramp(void* ctx, const DecodedEvent& ev);
   bool on_event(const DecodedEvent& ev);
@@ -122,6 +163,20 @@ class WyomingSatellite {
 
   TranscriptFn transcript_cb_ = nullptr;
   void* transcript_ctx_ = nullptr;
+
+  std::function<bool()> mic_muted_fn_;
+
+  // Wake mode. wake_task_ runs run_wake() when config_.wake_host is set.
+  TaskHandle_t wake_task_ = nullptr;
+  SemaphoreHandle_t wake_done_ = nullptr;  // given when run_wake() exits
+  // True while a detection-triggered pipeline is in flight, so the wake loop
+  // knows to hold off capture until run_mic() returns (single mic consumer).
+  std::atomic<bool> pipeline_active_{false};
+  // Set by on_event() when a `detection` arrives; consumed by wake_session(),
+  // which closes its own capture BEFORE running the pipeline so run_mic() is
+  // the sole ADC reader. Never run the pipeline from inside on_event() — the
+  // wake loop still owns the ADC at that point.
+  std::atomic<bool> wake_detected_{false};
 };
 
 }  // namespace sensesp_wyoming

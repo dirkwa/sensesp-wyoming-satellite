@@ -56,10 +56,21 @@ void build_audio_chunk(std::vector<uint8_t>& out, const AudioFormat& fmt,
                        const int16_t* samples, size_t frames);
 void build_audio_stop(std::vector<uint8_t>& out);
 
+// ---- Wake-word detection builders (satellite -> wake service) ------------
+
+// `detect` — arm the wake service for the given word names (empty = any).
+// Sent once after connecting to the wake service, before streaming mic audio.
+void build_detect(std::vector<uint8_t>& out,
+                  const std::vector<std::string>& names);
+
 // ---- Parsers: pull the fields we need from a DecodedEvent ----------------
 
 // Parse a `transcript` event's text. Returns false if not a transcript.
 bool parse_transcript(const DecodedEvent& ev, std::string* text);
+
+// Parse a `detection` event's wake-word name (empty if the field is absent).
+// Returns false if the event isn't a detection.
+bool parse_detection(const DecodedEvent& ev, std::string* name);
 
 // Parse an audio-start's format. Returns false if the event isn't
 // audio-start or the format is unusable.
