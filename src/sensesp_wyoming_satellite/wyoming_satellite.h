@@ -67,6 +67,10 @@ struct WyomingSatelliteConfig {
   // live mic (MIC1) reads modest; a small boost lifts speech into WakeNet's
   // preferred range. Keep conservative — too much amplifies noise equally.
   int wake_input_gain = 1;
+  // On-device WakeNet detection threshold (0.4-0.9999; 0 = model default).
+  // Lower = more sensitive (helps a quiet mic), at the cost of more false
+  // accepts.
+  float wake_threshold = 0.0f;
 
   // NETWORK (legacy fallback, on_device_wake=false): open a SECOND, outbound
   // connection to a Wyoming wake service (openWakeWord, default :10400) and

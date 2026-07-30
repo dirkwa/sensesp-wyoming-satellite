@@ -46,6 +46,9 @@ class WakeEngine {
   // quiet; a small boost can help, but too much just amplifies the noise
   // floor and hurts detection. Set before start().
   void set_input_gain(int g) { input_gain_ = g; }
+  // WakeNet detection threshold (0.4-0.9999; 0 = model default). Lower = more
+  // sensitive. Set before start().
+  void set_threshold(float t) { threshold_ = t; }
 
   // Initialise AFE + WakeNet from the "model" partition and start the feed +
   // fetch tasks. Returns false if no model is present or AFE init fails
@@ -80,6 +83,7 @@ class WakeEngine {
   int feed_chunk_ = 0;           // samples per feed (per channel)
   int feed_channels_ = 1;
   int input_gain_ = 1;
+  float threshold_ = 0.0f;
   char word_[24] = "";
 
   TaskHandle_t feed_task_ = nullptr;

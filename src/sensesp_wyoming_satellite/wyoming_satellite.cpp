@@ -48,6 +48,7 @@ void WyomingSatellite::start() {
     wake_engine_->set_muted_fn([this] { return mic_muted(); });
     wake_engine_->set_on_detect([this] { start_wake_pipeline(); });
     wake_engine_->set_input_gain(config_.wake_input_gain);
+    wake_engine_->set_threshold(config_.wake_threshold);
     if (!wake_engine_->start()) {
       ESP_LOGW(kTag, "on-device wake unavailable — tap-to-talk only");
       delete wake_engine_;

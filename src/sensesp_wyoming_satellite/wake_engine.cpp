@@ -60,6 +60,11 @@ bool WakeEngine::start() {
     return false;
   }
   strncpy(word_, cfg->wakenet_model_name, sizeof(word_) - 1);
+  // Disable the WebRTC VAD gate: on this quiet mic the VAD classified real
+  // speech as noise and gated it out before WakeNet, so the wake word never
+  // scored (detection was intermittent at best). WakeNet does its own gating;
+  // feed it every frame. Pipeline becomes [input] -> WakeNet.
+  cfg->vad_init = false;
   const esp_afe_sr_iface_t* handle = esp_afe_handle_from_config(cfg);
   esp_afe_sr_data_t* data = handle ? handle->create_from_config(cfg) : nullptr;
   ESP_LOGI(kTag, "AFE wakenet '%s'", word_);
@@ -73,6 +78,11 @@ bool WakeEngine::start() {
   afe_data_ = (void*)data;
   feed_chunk_ = handle->get_feed_chunksize(data);
   feed_channels_ = handle->get_channel_num(data);
+  // Quiet mic -> bias toward sensitivity: a lower detection threshold trades a
+  // few more false accepts for reliably catching the wake word. 0 = default.
+  if (threshold_ > 0.0f && handle->set_wakenet_threshold) {
+    handle->set_wakenet_threshold(data, 1, threshold_);
+  }
 
   audio_->start_capture();
   listening_.store(true);
