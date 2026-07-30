@@ -61,6 +61,12 @@ struct WyomingSatelliteConfig {
   uint16_t wake_port = 10400;         // wyoming-openwakeword default
   std::vector<std::string> wake_words;  // empty = listen for any word
   bool awake_cue = true;              // play a short blip on detection
+  // Digital gain applied to the wake stream ONLY (not the push-to-talk /
+  // whisper path, which is already well-served by the analog PGA). The
+  // onboard MEMS mics deliver quiet audio that openWakeWord's small model
+  // won't score even at max analog gain; a software boost lifts it into the
+  // model's comfortable range. Clamped to avoid hard clipping. 1.0 = off.
+  float wake_gain = 6.0f;
 };
 
 // Coarse state for a UI indicator.
@@ -92,6 +98,28 @@ class WyomingSatellite {
   bool running() const { return running_.load(); }
   bool client_connected() const { return client_connected_.load(); }
   SatState state() const { return state_.load(); }
+
+  // Wake diagnostics for /hello (all no-op meaningful when wake is disabled).
+  bool wake_enabled() const { return !config_.wake_host.empty(); }
+  bool wake_connected() const { return wake_connected_.load(); }
+  bool wake_capturing() const { return wake_capturing_.load(); }
+  // Monotonic count of audio-chunks streamed to the wake service — a nonzero
+  // and growing value proves the mic is actually feeding detection.
+  uint32_t wake_chunks() const { return wake_chunks_.load(); }
+  uint32_t wake_detections() const { return wake_detections_.load(); }
+  // Peak |sample| seen in the most recent capture window (0..32767). Reading
+  // it resets the running peak, so successive /hello calls report fresh peaks
+  // — near-zero means the mic is effectively silent (a level/wiring issue),
+  // a few thousand+ on speech means the audio is fine and the model isn't
+  // matching (format/model issue).
+  uint16_t wake_peak() { return wake_peak_.exchange(0); }
+
+  // Copy the most recent captured mic PCM (what we stream to the wake
+  // service) into `out` — up to `max_samples` int16 samples, newest run.
+  // Returns the number of samples copied. For an off-panel /mic_probe dump so
+  // the exact audio the detector sees can be inspected. capture_rate() is the
+  // sample rate. Thread-safe (guarded by the same send mutex).
+  size_t wake_pcm_snapshot(int16_t* out, size_t max_samples);
 
   // Optional UI hook: called (from the satellite task) with the recognised
   // text when a transcript arrives, so a widget can toast it. The callback
@@ -177,6 +205,21 @@ class WyomingSatellite {
   // the sole ADC reader. Never run the pipeline from inside on_event() — the
   // wake loop still owns the ADC at that point.
   std::atomic<bool> wake_detected_{false};
+  // Diagnostics (for /hello): connection + whether we're actively capturing +
+  // how many chunks we've streamed to the wake service + detections seen.
+  std::atomic<bool> wake_connected_{false};
+  std::atomic<bool> wake_capturing_{false};
+  std::atomic<uint32_t> wake_chunks_{0};
+  std::atomic<uint32_t> wake_detections_{0};
+  std::atomic<uint16_t> wake_peak_{0};  // max |sample| since last read
+
+  // Ring buffer of the most recent captured PCM (for /mic_probe). ~2 s at
+  // 16 kHz. Written by the wake loop, read under probe_mutex_.
+  static constexpr size_t kProbeSamples = 32000;  // 2 s @ 16 kHz
+  int16_t* probe_buf_ = nullptr;      // lazily allocated on first capture
+  size_t probe_head_ = 0;             // next write index
+  size_t probe_filled_ = 0;           // valid samples (<= kProbeSamples)
+  SemaphoreHandle_t probe_mutex_ = nullptr;
 };
 
 }  // namespace sensesp_wyoming
