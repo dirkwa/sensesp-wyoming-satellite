@@ -103,6 +103,22 @@ void build_audio_stop(std::vector<uint8_t>& out) {
   encode_event(out, "audio-stop");
 }
 
+void build_detect(std::vector<uint8_t>& out,
+                  const std::vector<std::string>& names) {
+  // `names` is serialized as null when empty (listen for any wake word),
+  // mirroring the reference Detect().
+  JsonDocument doc;
+  if (names.empty()) {
+    doc["names"] = nullptr;
+  } else {
+    JsonArray arr = doc["names"].to<JsonArray>();
+    for (const std::string& n : names) arr.add(n);
+  }
+  std::string data_json;
+  serializeJson(doc, data_json);
+  encode_event(out, "detect", data_json, nullptr, 0);
+}
+
 bool parse_transcript(const DecodedEvent& ev, std::string* text) {
   if (ev.type != "transcript" || ev.data_json.empty()) return false;
   JsonDocument doc;
@@ -110,6 +126,17 @@ bool parse_transcript(const DecodedEvent& ev, std::string* text) {
   const char* t = doc["text"];
   if (!t) return false;
   *text = t;
+  return true;
+}
+
+bool parse_detection(const DecodedEvent& ev, std::string* name) {
+  if (ev.type != "detection") return false;
+  name->clear();
+  if (ev.data_json.empty()) return true;  // detection with no data is valid
+  JsonDocument doc;
+  if (deserializeJson(doc, ev.data_json)) return true;
+  const char* n = doc["name"];  // null/absent -> leave empty
+  if (n) *name = n;
   return true;
 }
 

@@ -21,6 +21,7 @@ WyomingSatellite::WyomingSatellite(
   send_mutex_ = xSemaphoreCreateMutex();
   mic_done_ = xSemaphoreCreateBinary();
   server_done_ = xSemaphoreCreateBinary();
+  wake_done_ = xSemaphoreCreateBinary();
 }
 
 WyomingSatellite::~WyomingSatellite() {
@@ -28,6 +29,7 @@ WyomingSatellite::~WyomingSatellite() {
   if (send_mutex_) vSemaphoreDelete(send_mutex_);
   if (mic_done_) vSemaphoreDelete(mic_done_);
   if (server_done_) vSemaphoreDelete(server_done_);
+  if (wake_done_) vSemaphoreDelete(wake_done_);
 }
 
 void WyomingSatellite::start() {
@@ -35,6 +37,12 @@ void WyomingSatellite::start() {
   xTaskCreate(&WyomingSatellite::server_task, "wyoming_sat", 6144, this, 3,
               &server_task_);
   ESP_LOGI(kTag, "Wyoming satellite starting on port %u", config_.port);
+  if (!config_.wake_host.empty()) {
+    xTaskCreate(&WyomingSatellite::wake_task, "wyoming_wake", 4608, this, 3,
+                &wake_task_);
+    ESP_LOGI(kTag, "Wake mode: streaming to %s:%u", config_.wake_host.c_str(),
+             config_.wake_port);
+  }
 }
 
 void WyomingSatellite::stop() {
@@ -43,6 +51,14 @@ void WyomingSatellite::stop() {
   // client socket unblocks recv; the accept loop wakes on its select tick.
   if (client_sock_ >= 0) {
     shutdown(client_sock_, SHUT_RDWR);
+  }
+  // The wake task blocks in connect()/recv() with short timeouts, so it wakes
+  // on its next tick and exits on running_==false. Join it before freeing.
+  if (wake_task_) {
+    if (xSemaphoreTake(wake_done_, pdMS_TO_TICKS(8000)) != pdTRUE) {
+      ESP_LOGE(kTag, "wake task did not exit in time — leaking task handle");
+    }
+    wake_task_ = nullptr;
   }
   if (server_task_) {
     // Real join: serve() gives server_done_ just before the task self-deletes
@@ -314,7 +330,19 @@ bool WyomingSatellite::on_event(const DecodedEvent& ev) {
     return true;
   }
 
-  // detection / everything else: ignored (forward-compatible — unknown
+  if (t == "detection") {
+    // From the wake service (wake task context, called from within
+    // wake_session()'s decoder.feed while the wake loop still owns the ADC).
+    // Only flag it here — wake_session() closes its capture and THEN runs the
+    // pipeline, so run_mic() is the sole ADC reader (single mic consumer).
+    std::string name;
+    parse_detection(ev, &name);
+    ESP_LOGI(kTag, "wake detection: \"%s\"", name.c_str());
+    wake_detected_.store(true);
+    return true;
+  }
+
+  // not-detected / everything else: ignored (forward-compatible — unknown
   // events are not errors).
   return true;
 }
@@ -409,6 +437,215 @@ void WyomingSatellite::run_mic() {
   set_state(SatState::Idle);
   mic_running_.store(false);
   xSemaphoreGive(mic_done_);
+}
+
+// ---- Wake mode ------------------------------------------------------------
+
+void WyomingSatellite::wake_task(void* arg) {
+  auto* self = static_cast<WyomingSatellite*>(arg);
+  self->run_wake();
+  xSemaphoreGive(self->wake_done_);
+  vTaskDelete(nullptr);
+}
+
+void WyomingSatellite::run_wake() {
+  // Reconnect loop to the wake service. Each successful connection runs a
+  // capture-and-detect session; on any drop we back off and retry until
+  // stop() clears running_.
+  TickType_t backoff = pdMS_TO_TICKS(1000);
+  const TickType_t kMaxBackoff = pdMS_TO_TICKS(10000);
+
+  while (running_.load()) {
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+      vTaskDelay(backoff);
+      continue;
+    }
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(config_.wake_port);
+    if (inet_pton(AF_INET, config_.wake_host.c_str(), &addr.sin_addr) != 1) {
+      // Only a dotted-quad is accepted here; the caller resolves a hostname
+      // to an IP before constructing the satellite.
+      ESP_LOGE(kTag, "wake host '%s' is not an IPv4 address — wake disabled",
+               config_.wake_host.c_str());
+      close(sock);
+      return;
+    }
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+      close(sock);
+      if (running_.load()) vTaskDelay(backoff);
+      backoff = backoff * 2 > kMaxBackoff ? kMaxBackoff : backoff * 2;
+      continue;
+    }
+    ESP_LOGI(kTag, "wake service connected %s:%u", config_.wake_host.c_str(),
+             config_.wake_port);
+    backoff = pdMS_TO_TICKS(1000);  // reset after a good connection
+    wake_session(sock);
+    close(sock);
+    ESP_LOGI(kTag, "wake service disconnected");
+    if (running_.load()) vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+bool WyomingSatellite::wake_session(int sock) {
+  // Short recv timeout so a `detection` is noticed promptly and running_ /
+  // mute changes are polled between mic reads.
+  struct timeval rcv_tv = {.tv_sec = 0, .tv_usec = 50000};  // 50 ms
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
+  struct timeval snd_tv = {.tv_sec = 2, .tv_usec = 0};
+  setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
+
+  // Arm the service for our configured wake words (empty = any), then stream
+  // the mic. detect + a leading audio-start open the stream.
+  auto sock_send = [&](const std::vector<uint8_t>& b) -> bool {
+    size_t off = 0;
+    while (off < b.size()) {
+      int s = send(sock, b.data() + off, b.size() - off, MSG_NOSIGNAL);
+      if (s <= 0) {
+        if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+          vTaskDelay(pdMS_TO_TICKS(5));
+          continue;
+        }
+        return false;
+      }
+      off += (size_t)s;
+    }
+    return true;
+  };
+
+  {
+    std::vector<uint8_t> det;
+    build_detect(det, config_.wake_words);
+    if (!sock_send(det)) return false;
+  }
+
+  const AudioFormat mic_fmt = {audio_->capture_rate(), 2, 1};
+  const size_t kChunkFrames = 512;  // 32 ms at 16 kHz
+  int16_t* buf = (int16_t*)malloc(kChunkFrames * sizeof(int16_t));
+  if (!buf) return false;
+
+  bool capturing = false;   // ADC open + audio-start sent
+  bool muted_last = false;  // last mute state, to open/close on transitions
+  wake_detected_.store(false);
+  EventDecoder decoder;
+  uint8_t recv_buf[512];
+
+  auto open_capture = [&]() -> bool {
+    if (capturing) return true;
+    audio_->start_capture();
+    std::vector<uint8_t> start;
+    build_audio_start(start, mic_fmt);
+    if (!sock_send(start)) return false;
+    capturing = true;
+    return true;
+  };
+  auto close_capture = [&]() {
+    if (!capturing) return;
+    std::vector<uint8_t> stop;
+    build_audio_stop(stop);
+    sock_send(stop);
+    audio_->stop_capture();
+    capturing = false;
+  };
+
+  bool ok = true;
+  while (running_.load()) {
+    // Drain any inbound events first (detection / not-detected).
+    int n = recv(sock, recv_buf, sizeof(recv_buf), 0);
+    if (n > 0) {
+      if (!decoder.feed(recv_buf, (size_t)n, &WyomingSatellite::on_event_tramp,
+                        this)) {
+        ok = false;
+        break;
+      }
+    } else if (n == 0) {
+      ok = false;
+      break;  // service closed
+    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      ok = false;
+      break;  // real error
+    }
+
+    // A wake word fired: hand the mic to the orchestrator pipeline. Close our
+    // capture FIRST (release the ADC) so run_mic() is the sole reader, play
+    // the awake cue, then run the pipeline. This blocks the wake loop for the
+    // whole utterance — exactly right, the mic has one owner at a time.
+    if (wake_detected_.exchange(false)) {
+      close_capture();
+      if (config_.awake_cue) play_done_tone();
+      run_detection_pipeline();
+      continue;
+    }
+
+    // A PTT press can also start a pipeline (the tap-to-talk widget). Same
+    // rule: release the ADC and wait it out.
+    if (pipeline_active_.load() || listening_.load()) {
+      close_capture();
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    // Privacy gate: when muted, don't stream to the wake service at all.
+    const bool muted = mic_muted();
+    if (muted != muted_last) {
+      if (muted) close_capture();
+      muted_last = muted;
+    }
+    if (muted) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    if (!open_capture()) {
+      ok = false;
+      break;
+    }
+    size_t frames = audio_->record_pcm(buf, kChunkFrames);
+    if (frames == 0) continue;
+    std::vector<uint8_t> chunk;
+    build_audio_chunk(chunk, mic_fmt, buf, frames);
+    if (!sock_send(chunk)) {
+      ok = false;
+      break;
+    }
+  }
+
+  close_capture();
+  free(buf);
+  return ok;
+}
+
+void WyomingSatellite::run_detection_pipeline() {
+  // A wake word fired: run the same pipeline PTT does. The socket task starts
+  // run_mic() when it sees ptt_held_ && !listening_; we set that, then wait
+  // for the stream to begin and end so the wake loop stays off the mic for
+  // the whole pipeline (single consumer). No release tail is needed — the
+  // orchestrator's silence gate ends the utterance and clears listening_.
+  if (!client_connected_.load() || !armed_) {
+    ESP_LOGW(kTag, "detection ignored (no orchestrator / not armed)");
+    return;
+  }
+  if (mic_muted()) return;  // privacy gate
+  pipeline_active_.store(true);
+  set_ptt_held(true);
+
+  // Wait for run_mic() to actually take over the mic (listening_ true), then
+  // for it to finish. Bounded so a stream that never starts can't wedge us.
+  const TickType_t kStartTimeout = pdMS_TO_TICKS(1500);
+  const TickType_t kMaxPipeline = pdMS_TO_TICKS(25000);
+  TickType_t t0 = xTaskGetTickCount();
+  while (running_.load() && !listening_.load() &&
+         xTaskGetTickCount() - t0 < kStartTimeout) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  t0 = xTaskGetTickCount();
+  while (running_.load() && listening_.load() &&
+         xTaskGetTickCount() - t0 < kMaxPipeline) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  set_ptt_held(false);
+  pipeline_active_.store(false);
 }
 
 void WyomingSatellite::play_done_tone() {
