@@ -128,7 +128,7 @@ void WyomingSatellite::handle_client(int sock) {
   streaming_ = false;
   armed_ = false;
   listening_.store(false);
-  ptt_pending_.store(false);
+  ptt_held_.store(false);
   set_state(SatState::Idle);
 
   // Short read timeout so an inbound ping is answered well within the 5s
@@ -142,10 +142,12 @@ void WyomingSatellite::handle_client(int sock) {
   uint8_t recv_buf[1600];
 
   while (running_.load()) {
-    // A push-to-talk request arrives asynchronously (UI task). Start the mic
-    // stream here on the satellite task so all socket writes stay serialised.
-    if (ptt_pending_.exchange(false)) {
-      if (armed_ && !listening_.load() && !streaming_) {
+    // Push-to-talk is level-triggered: start a stream when the button is held
+    // and we aren't already streaming. Starting here on the satellite task
+    // keeps all socket writes serialised. A brief hold (released before this
+    // tick) simply never satisfies the condition — no spurious stream.
+    if (ptt_held_.load() && !listening_.load()) {
+      if (armed_ && !streaming_) {
         std::vector<uint8_t> rp;
         build_run_pipeline(rp, config_.name);
         if (send_all(rp)) {
@@ -243,6 +245,7 @@ bool WyomingSatellite::on_event(const DecodedEvent& ev) {
   if (t == "pause-satellite") {
     // Output-only: keep mic off the wire. Playback still works.
     armed_ = false;
+    ptt_held_.store(false);  // ignore a held button while paused
     listening_.store(false);
     ESP_LOGI(kTag, "pause-satellite (output only)");
     return true;
@@ -299,7 +302,9 @@ bool WyomingSatellite::on_event(const DecodedEvent& ev) {
     if (parse_transcript(ev, &text)) {
       // End of the utterance: stop streaming mic audio, play the done sound,
       // surface the text to the UI. The orchestrator publishes it to
-      // SignalK's voice.command — we don't.
+      // SignalK's voice.command — we don't. Clear ptt_held_ too so a still-
+      // held button doesn't immediately start a second utterance.
+      ptt_held_.store(false);
       listening_.store(false);
       set_state(SatState::Idle);
       ESP_LOGI(kTag, "transcript: \"%s\"", text.c_str());
@@ -314,12 +319,14 @@ bool WyomingSatellite::on_event(const DecodedEvent& ev) {
   return true;
 }
 
-void WyomingSatellite::trigger_ptt() {
-  // Called from any task (e.g. the LVGL UI). The satellite task picks this
-  // up between recvs and starts the stream, so socket writes stay on one
-  // task. Cheap and lock-free.
-  if (!client_connected_.load()) return;
-  ptt_pending_.store(true);
+void WyomingSatellite::set_ptt_held(bool held) {
+  // Level-triggered from any task (e.g. the LVGL UI): just records whether the
+  // button is held. The socket task starts a stream when it sees held &&
+  // !listening_, and run_mic() stops streaming when held goes false. No edge
+  // race between press and release — the held flag is the single source of
+  // truth. Lock-free.
+  if (held && !client_connected_.load()) return;
+  ptt_held_.store(held);
 }
 
 void WyomingSatellite::mic_task(void* arg) {
@@ -361,12 +368,25 @@ void WyomingSatellite::run_mic() {
     send_all(start);
   }
 
-  // The orchestrator's endpointer ends the utterance on ~800 ms of silence
-  // (its maxUtteranceMs is 10 s). This cap is only a backstop for a stuck
-  // stream, so keep it just above the orchestrator's own max.
+  // Stream while the button is held, then for a short RELEASE TAIL after it
+  // is let go. The orchestrator ends an utterance only when its own energy
+  // gate sees ~800 ms of silence — it ignores a satellite audio-stop — so on
+  // release we keep streaming the (now-quiet) mic for kReleaseTailMs. That
+  // near-silent tail trips the gate and the transcript comes back in ~1 s,
+  // instead of the pipeline timing out 30 s later. A safety cap bounds a
+  // stuck-held button; a received transcript clears listening_ early.
   const TickType_t t0 = xTaskGetTickCount();
-  const TickType_t kMaxTicks = pdMS_TO_TICKS(12000);
+  const TickType_t kMaxTicks = pdMS_TO_TICKS(20000);
+  const TickType_t kReleaseTailTicks = pdMS_TO_TICKS(1200);
+  TickType_t release_at = 0;  // 0 = still held
   while (listening_.load() && running_.load() && client_connected_.load()) {
+    if (!ptt_held_.load() && release_at == 0) {
+      release_at = xTaskGetTickCount();  // start the tail on release
+    }
+    if (release_at != 0 &&
+        xTaskGetTickCount() - release_at > kReleaseTailTicks) {
+      break;  // tail done — let the orchestrator's gate have ended it
+    }
     if (xTaskGetTickCount() - t0 > kMaxTicks) {
       ESP_LOGW(kTag, "mic stream hit safety cap — stopping");
       break;

@@ -54,12 +54,18 @@ class WyomingSatellite {
   void start();
   void stop();
 
-  // Push-to-talk: begin a voice-command utterance. Safe to call from any
-  // task (e.g. the LVGL UI on a mic-button press). No-op if not connected,
-  // if the orchestrator hasn't armed us (run-satellite), or if already
-  // listening. Streaming stops when the orchestrator returns a transcript
-  // (or on a short safety timeout).
-  void trigger_ptt();
+  // Push-to-talk, LEVEL-triggered (press-and-hold): set held=true on the mic
+  // button press, held=false on release. Safe to call from any task (e.g. the
+  // LVGL UI). The satellite streams the mic while held is true and the
+  // orchestrator has armed us (run-satellite); on release it sends audio-stop
+  // and the orchestrator transcribes what it captured — no wait for silence
+  // detection, and no edge/ordering race between press and release.
+  void set_ptt_held(bool held);
+
+  // Momentary trigger (tap-to-talk fallback): behaves like a press+auto-hold
+  // that the orchestrator's silence endpointer ends. Kept for callers that
+  // don't do press/release. Equivalent to set_ptt_held(true) with no release.
+  void trigger_ptt() { set_ptt_held(true); }
 
   // For a /hello-style status line + a UI indicator.
   bool running() const { return running_.load(); }
@@ -106,11 +112,13 @@ class WyomingSatellite {
   bool streaming_ = false;  // playback: between audio-start and audio-stop
   AudioFormat play_fmt_;
 
-  // Voice-in (push-to-talk).
+  // Voice-in (push-to-talk). Level-triggered: ptt_held_ reflects the button
+  // being physically held; the socket task starts a stream when held && !
+  // listening_, and the mic task streams while held_ stays true.
   std::atomic<bool> mic_running_{false};  // mic task alive (set by the task)
   SemaphoreHandle_t mic_done_ = nullptr;  // given when run_mic() exits
-  std::atomic<bool> listening_{false};    // mic task should stream
-  std::atomic<bool> ptt_pending_{false};
+  std::atomic<bool> listening_{false};    // a mic stream is currently active
+  std::atomic<bool> ptt_held_{false};     // button held (UI sets true/false)
 
   TranscriptFn transcript_cb_ = nullptr;
   void* transcript_ctx_ = nullptr;
