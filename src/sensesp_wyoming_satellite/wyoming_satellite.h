@@ -41,6 +41,7 @@
 
 #include "sensesp_cockpit_display/hal/audio_driver.h"
 #include "sensesp_wyoming_satellite/protocol/events.h"
+#include "sensesp_wyoming_satellite/wake_engine.h"
 
 namespace sensesp_wyoming {
 
@@ -52,20 +53,30 @@ struct WyomingSatelliteConfig {
   // 16000 if you constrain the orchestrator to 16 kHz voices.
   uint32_t snd_rate = 22050;
 
-  // --- Hands-free wake word (optional; empty host = disabled) --------------
-  // When wake_host is set, the satellite opens a SECOND, outbound connection
-  // to a Wyoming wake service (openWakeWord, default :10400), streams the mic
-  // to it continuously, and on `detection` runs a pipeline toward the
-  // orchestrator exactly as a push-to-talk press would. No button needed.
+  // --- Hands-free wake word ------------------------------------------------
+  // Two mutually exclusive back-ends:
+  //
+  // ON-DEVICE (default, recommended): esp-sr AFE + WakeNet runs the detector
+  // on the panel from the raw mic. Its front-end (noise suppression + AGC) is
+  // built for far-field embedded mics, unlike a remote openWakeWord which
+  // scored this panel's mic near zero. The model (which word) is chosen in
+  // sdkconfig + flashed to the "model" partition. No wake_host needed.
+  bool on_device_wake = true;
+  bool awake_cue = true;              // play a short blip on detection
+  // Pre-AFE software gain for the on-device wake feed (1 = off). The panel's
+  // live mic (MIC1) reads modest; a small boost lifts speech into WakeNet's
+  // preferred range. Keep conservative — too much amplifies noise equally.
+  int wake_input_gain = 1;
+
+  // NETWORK (legacy fallback, on_device_wake=false): open a SECOND, outbound
+  // connection to a Wyoming wake service (openWakeWord, default :10400) and
+  // stream the mic to it. Kept as a reference / for a future better remote
+  // detector, but on-device is the working path on this hardware.
   std::string wake_host;              // e.g. the SK server host; "" = off
   uint16_t wake_port = 10400;         // wyoming-openwakeword default
   std::vector<std::string> wake_words;  // empty = listen for any word
-  bool awake_cue = true;              // play a short blip on detection
-  // Digital gain applied to the wake stream ONLY (not the push-to-talk /
-  // whisper path, which is already well-served by the analog PGA). The
-  // onboard MEMS mics deliver quiet audio that openWakeWord's small model
-  // won't score even at max analog gain; a software boost lifts it into the
-  // model's comfortable range. Clamped to avoid hard clipping. 1.0 = off.
+  // Digital gain applied to the NETWORK wake stream only (the on-device AFE
+  // has its own AGC and ignores this). 1.0 = off.
   float wake_gain = 6.0f;
 };
 
@@ -99,14 +110,36 @@ class WyomingSatellite {
   bool client_connected() const { return client_connected_.load(); }
   SatState state() const { return state_.load(); }
 
-  // Wake diagnostics for /hello (all no-op meaningful when wake is disabled).
-  bool wake_enabled() const { return !config_.wake_host.empty(); }
-  bool wake_connected() const { return wake_connected_.load(); }
-  bool wake_capturing() const { return wake_capturing_.load(); }
-  // Monotonic count of audio-chunks streamed to the wake service — a nonzero
-  // and growing value proves the mic is actually feeding detection.
+  // Wake diagnostics for /hello (meaningful when a wake back-end is active).
+  // On-device: "connected"/"capturing" reflect the engine; chunks is 0 (no
+  // network stream). Network: the legacy counters below.
+  bool wake_enabled() const {
+    return config_.on_device_wake ? wake_engine_ != nullptr
+                                  : !config_.wake_host.empty();
+  }
+  bool wake_on_device() const { return config_.on_device_wake; }
+  bool wake_connected() const {
+    return config_.on_device_wake
+               ? (wake_engine_ && wake_engine_->running())
+               : wake_connected_.load();
+  }
+  bool wake_capturing() const {
+    return config_.on_device_wake
+               ? (wake_engine_ && wake_engine_->listening())
+               : wake_capturing_.load();
+  }
+  // Monotonic count of audio-chunks streamed to the network wake service — a
+  // nonzero and growing value proves the mic is feeding detection (network
+  // path only; 0 for on-device).
   uint32_t wake_chunks() const { return wake_chunks_.load(); }
-  uint32_t wake_detections() const { return wake_detections_.load(); }
+  uint32_t wake_detections() const {
+    return config_.on_device_wake
+               ? (wake_engine_ ? wake_engine_->detections() : 0)
+               : wake_detections_.load();
+  }
+  const char* wake_word() const {
+    return (config_.on_device_wake && wake_engine_) ? wake_engine_->word() : "";
+  }
   // Peak |sample| seen in the most recent capture window (0..32767). Reading
   // it resets the running peak, so successive /hello calls report fresh peaks
   // — near-zero means the mic is effectively silent (a level/wiring issue),
@@ -194,7 +227,12 @@ class WyomingSatellite {
 
   std::function<bool()> mic_muted_fn_;
 
-  // Wake mode. wake_task_ runs run_wake() when config_.wake_host is set.
+  // On-device wake (config_.on_device_wake): esp-sr AFE + WakeNet. Owns the
+  // mic while listening; on detection it fires start_wake_pipeline().
+  WakeEngine* wake_engine_ = nullptr;
+  void start_wake_pipeline();  // detection -> pause engine -> run pipeline -> resume
+
+  // Network wake (legacy). wake_task_ runs run_wake() when wake_host is set.
   TaskHandle_t wake_task_ = nullptr;
   SemaphoreHandle_t wake_done_ = nullptr;  // given when run_wake() exits
   // True while a detection-triggered pipeline is in flight, so the wake loop

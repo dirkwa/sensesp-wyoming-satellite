@@ -40,10 +40,23 @@ void WyomingSatellite::start() {
   xTaskCreate(&WyomingSatellite::server_task, "wyoming_sat", 6144, this, 3,
               &server_task_);
   ESP_LOGI(kTag, "Wyoming satellite starting on port %u", config_.port);
-  if (!config_.wake_host.empty()) {
+
+  if (config_.on_device_wake) {
+    // On-device wake: esp-sr AFE + WakeNet reads the mic locally. On a
+    // detection it runs the same pipeline PTT does.
+    wake_engine_ = new WakeEngine(audio_);
+    wake_engine_->set_muted_fn([this] { return mic_muted(); });
+    wake_engine_->set_on_detect([this] { start_wake_pipeline(); });
+    wake_engine_->set_input_gain(config_.wake_input_gain);
+    if (!wake_engine_->start()) {
+      ESP_LOGW(kTag, "on-device wake unavailable — tap-to-talk only");
+      delete wake_engine_;
+      wake_engine_ = nullptr;
+    }
+  } else if (!config_.wake_host.empty()) {
     xTaskCreate(&WyomingSatellite::wake_task, "wyoming_wake", 4608, this, 3,
                 &wake_task_);
-    ESP_LOGI(kTag, "Wake mode: streaming to %s:%u", config_.wake_host.c_str(),
+    ESP_LOGI(kTag, "Network wake: streaming to %s:%u", config_.wake_host.c_str(),
              config_.wake_port);
   }
 }
@@ -55,8 +68,14 @@ void WyomingSatellite::stop() {
   if (client_sock_ >= 0) {
     shutdown(client_sock_, SHUT_RDWR);
   }
-  // The wake task blocks in connect()/recv() with short timeouts, so it wakes
-  // on its next tick and exits on running_==false. Join it before freeing.
+  // On-device wake engine: stop its feed/fetch tasks and release the mic.
+  if (wake_engine_) {
+    wake_engine_->stop();
+    delete wake_engine_;
+    wake_engine_ = nullptr;
+  }
+  // The network wake task blocks in connect()/recv() with short timeouts, so
+  // it wakes on its next tick and exits on running_==false. Join it first.
   if (wake_task_) {
     if (xSemaphoreTake(wake_done_, pdMS_TO_TICKS(8000)) != pdTRUE) {
       ESP_LOGE(kTag, "wake task did not exit in time — leaking task handle");
@@ -659,6 +678,21 @@ bool WyomingSatellite::wake_session(int sock) {
   close_capture();
   free(buf);
   return ok;
+}
+
+void WyomingSatellite::start_wake_pipeline() {
+  // Called from the WakeEngine fetch task on a detection. Pause the engine so
+  // it releases the mic (single consumer), play the awake cue, run the same
+  // pipeline PTT does, then resume the engine to listen for the next word.
+  if (!client_connected_.load() || !armed_) {
+    ESP_LOGW(kTag, "wake ignored (no orchestrator / not armed)");
+    return;
+  }
+  if (mic_muted()) return;
+  if (wake_engine_) wake_engine_->pause();  // frees the mic for run_mic()
+  if (config_.awake_cue) play_done_tone();
+  run_detection_pipeline();
+  if (wake_engine_) wake_engine_->resume();
 }
 
 void WyomingSatellite::run_detection_pipeline() {
