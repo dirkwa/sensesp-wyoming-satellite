@@ -759,6 +759,16 @@ size_t WyomingSatellite::wake_pcm_snapshot(int16_t* out, size_t max_samples) {
   return n;
 }
 
+void WyomingSatellite::wake_pcm_clear() {
+  // Drop any retained mic PCM (privacy: called when the mic is muted so a
+  // later /mic_probe can't surface audio captured before the mute).
+  if (!probe_mutex_) return;
+  if (xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) return;
+  probe_head_ = 0;
+  probe_filled_ = 0;
+  xSemaphoreGive(probe_mutex_);
+}
+
 void WyomingSatellite::play_done_tone() {
   // Short confirmation blip so the user knows the utterance was captured.
   const uint32_t rate = 16000;

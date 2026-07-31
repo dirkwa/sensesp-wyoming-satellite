@@ -162,6 +162,9 @@ class WyomingSatellite {
   // (guarded by probe_mutex_). NOTE: the probe ring is filled only by the
   // NETWORK wake path — on-device wake returns an empty snapshot.
   size_t wake_pcm_snapshot(int16_t* out, size_t max_samples);
+  // Drop any retained mic PCM. Call when the mic is muted so /mic_probe can't
+  // surface audio captured before the mute (privacy).
+  void wake_pcm_clear();
 
   // Optional UI hook: called (from the satellite task) with the recognised
   // text when a transcript arrives, so a widget can toast it. The callback
