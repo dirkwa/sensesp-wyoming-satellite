@@ -43,16 +43,23 @@ void WyomingSatellite::start() {
 
   if (config_.on_device_wake) {
     // On-device wake: esp-sr AFE + WakeNet reads the mic locally. On a
-    // detection it runs the same pipeline PTT does.
-    wake_engine_ = new WakeEngine(audio_);
-    wake_engine_->set_muted_fn([this] { return mic_muted(); });
-    wake_engine_->set_on_detect([this] { start_wake_pipeline(); });
-    wake_engine_->set_input_gain(config_.wake_input_gain);
-    wake_engine_->set_threshold(config_.wake_threshold);
-    if (!wake_engine_->start()) {
-      ESP_LOGW(kTag, "on-device wake unavailable — tap-to-talk only");
-      delete wake_engine_;
-      wake_engine_ = nullptr;
+    // detection it runs the same pipeline PTT does. Build + configure a local
+    // first; only publish to wake_engine_ once it's live, so /hello never sees
+    // a half-constructed engine. (new can yield nullptr with -fno-exceptions.)
+    WakeEngine* e = new WakeEngine(audio_);
+    if (!e) {
+      ESP_LOGW(kTag, "on-device wake alloc failed — tap-to-talk only");
+    } else {
+      e->set_muted_fn([this] { return mic_muted(); });
+      e->set_on_detect([this] { start_wake_pipeline(); });
+      e->set_input_gain(config_.wake_input_gain);
+      e->set_threshold(config_.wake_threshold);
+      if (e->start()) {
+        wake_engine_.store(e);
+      } else {
+        ESP_LOGW(kTag, "on-device wake unavailable — tap-to-talk only");
+        delete e;
+      }
     }
   } else if (!config_.wake_host.empty()) {
     xTaskCreate(&WyomingSatellite::wake_task, "wyoming_wake", 4608, this, 3,
@@ -69,11 +76,11 @@ void WyomingSatellite::stop() {
   if (client_sock_ >= 0) {
     shutdown(client_sock_, SHUT_RDWR);
   }
-  // On-device wake engine: stop its feed/fetch tasks and release the mic.
-  if (wake_engine_) {
-    wake_engine_->stop();
-    delete wake_engine_;
-    wake_engine_ = nullptr;
+  // On-device wake engine: DETACH the pointer before stopping/deleting so a
+  // /hello diagnostics read in flight sees null rather than a freed engine.
+  if (WakeEngine* e = wake_engine_.exchange(nullptr)) {
+    e->stop();  // joins the feed/fetch tasks + releases the mic
+    delete e;
   }
   // The network wake task blocks in connect()/recv() with short timeouts, so
   // it wakes on its next tick and exits on running_==false. Join it first.
@@ -690,10 +697,13 @@ void WyomingSatellite::start_wake_pipeline() {
     return;
   }
   if (mic_muted()) return;
-  if (wake_engine_) wake_engine_->pause();  // frees the mic for run_mic()
+  // Runs on the engine's own fetch task, so the engine outlives this call;
+  // snapshot the atomic once for the type.
+  WakeEngine* e = wake_engine_.load();
+  if (e) e->pause();  // frees the mic for run_mic()
   if (config_.awake_cue) play_done_tone();
   run_detection_pipeline();
-  if (wake_engine_) wake_engine_->resume();
+  if (e) e->resume();
 }
 
 void WyomingSatellite::run_detection_pipeline() {

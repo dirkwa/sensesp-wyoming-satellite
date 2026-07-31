@@ -88,7 +88,15 @@ class WakeEngine {
 
   TaskHandle_t feed_task_ = nullptr;
   TaskHandle_t fetch_task_ = nullptr;
-  SemaphoreHandle_t feed_paused_ = nullptr;  // given when feed loop parks
+  // Given once by each loop as it returns, so stop() JOINs the tasks before
+  // freeing the AFE / releasing the mic (never vTaskDelete mid-inference).
+  SemaphoreHandle_t feed_exited_ = nullptr;
+  SemaphoreHandle_t fetch_exited_ = nullptr;
+  // pause() ⇄ feed_loop() handshake: the feed loop gives this exactly once
+  // when it parks *for a pause* (not for mute), and pause() takes it. A
+  // generation counter makes each pause wait for a fresh park rather than a
+  // stale token.
+  SemaphoreHandle_t feed_paused_ = nullptr;
 
   std::atomic<bool> running_{false};
   std::atomic<bool> paused_{false};

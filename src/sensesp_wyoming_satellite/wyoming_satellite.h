@@ -117,45 +117,50 @@ class WyomingSatellite {
   // Wake diagnostics for /hello (meaningful when a wake back-end is active).
   // On-device: "connected"/"capturing" reflect the engine; chunks is 0 (no
   // network stream). Network: the legacy counters below.
+  // These run on whatever task serves /hello, while stop() may be tearing the
+  // engine down — snapshot the atomic pointer once per call so a concurrent
+  // delete-then-null can't turn a non-null check into a freed dereference.
   bool wake_enabled() const {
-    return config_.on_device_wake ? wake_engine_ != nullptr
+    return config_.on_device_wake ? wake_engine_.load() != nullptr
                                   : !config_.wake_host.empty();
   }
   bool wake_on_device() const { return config_.on_device_wake; }
   bool wake_connected() const {
-    return config_.on_device_wake
-               ? (wake_engine_ && wake_engine_->running())
-               : wake_connected_.load();
+    if (!config_.on_device_wake) return wake_connected_.load();
+    WakeEngine* e = wake_engine_.load();
+    return e && e->running();
   }
   bool wake_capturing() const {
-    return config_.on_device_wake
-               ? (wake_engine_ && wake_engine_->listening())
-               : wake_capturing_.load();
+    if (!config_.on_device_wake) return wake_capturing_.load();
+    WakeEngine* e = wake_engine_.load();
+    return e && e->listening();
   }
   // Monotonic count of audio-chunks streamed to the network wake service — a
   // nonzero and growing value proves the mic is feeding detection (network
   // path only; 0 for on-device).
   uint32_t wake_chunks() const { return wake_chunks_.load(); }
   uint32_t wake_detections() const {
-    return config_.on_device_wake
-               ? (wake_engine_ ? wake_engine_->detections() : 0)
-               : wake_detections_.load();
+    if (!config_.on_device_wake) return wake_detections_.load();
+    WakeEngine* e = wake_engine_.load();
+    return e ? e->detections() : 0;
   }
   const char* wake_word() const {
-    return (config_.on_device_wake && wake_engine_) ? wake_engine_->word() : "";
+    if (!config_.on_device_wake) return "";
+    WakeEngine* e = wake_engine_.load();
+    return e ? e->word() : "";
   }
   // Peak |sample| seen in the most recent capture window (0..32767). Reading
-  // it resets the running peak, so successive /hello calls report fresh peaks
-  // — near-zero means the mic is effectively silent (a level/wiring issue),
-  // a few thousand+ on speech means the audio is fine and the model isn't
-  // matching (format/model issue).
+  // it resets the running peak. NOTE: fed only by the NETWORK wake path — on
+  // the on-device path (default) it stays 0. A near-zero network peak means
+  // the mic is effectively silent; a few thousand+ on speech means the audio
+  // is fine and the model isn't matching.
   uint16_t wake_peak() { return wake_peak_.exchange(0); }
 
-  // Copy the most recent captured mic PCM (what we stream to the wake
-  // service) into `out` — up to `max_samples` int16 samples, newest run.
-  // Returns the number of samples copied. For an off-panel /mic_probe dump so
-  // the exact audio the detector sees can be inspected. capture_rate() is the
-  // sample rate. Thread-safe (guarded by the same send mutex).
+  // Copy the most recent captured mic PCM into `out` — up to `max_samples`
+  // int16 samples, newest run; returns the count copied. For an off-panel
+  // /mic_probe WAV dump. capture_rate() is the sample rate. Thread-safe
+  // (guarded by probe_mutex_). NOTE: the probe ring is filled only by the
+  // NETWORK wake path — on-device wake returns an empty snapshot.
   size_t wake_pcm_snapshot(int16_t* out, size_t max_samples);
 
   // Optional UI hook: called (from the satellite task) with the recognised
@@ -233,7 +238,9 @@ class WyomingSatellite {
 
   // On-device wake (config_.on_device_wake): esp-sr AFE + WakeNet. Owns the
   // mic while listening; on detection it fires start_wake_pipeline().
-  WakeEngine* wake_engine_ = nullptr;
+  // Atomic so /hello diagnostics can read it concurrently with stop()'s
+  // detach-then-delete without a use-after-free.
+  std::atomic<WakeEngine*> wake_engine_{nullptr};
   void start_wake_pipeline();  // detection -> pause engine -> run pipeline -> resume
 
   // Network wake (legacy). wake_task_ runs run_wake() when wake_host is set.

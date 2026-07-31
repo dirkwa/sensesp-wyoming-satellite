@@ -29,6 +29,8 @@ WakeEngine::~WakeEngine() { stop(); }
 bool WakeEngine::start() {
   if (running_.exchange(true)) return true;
   feed_paused_ = xSemaphoreCreateBinary();
+  feed_exited_ = xSemaphoreCreateBinary();
+  fetch_exited_ = xSemaphoreCreateBinary();
 
   // NOTE: do NOT dereference srmodel_list_t fields here — mirror the esp-sr
   // Arduino HAL, which passes the opaque list straight to afe_config_init()
@@ -50,9 +52,8 @@ bool WakeEngine::start() {
     running_.store(false);
     return false;
   }
-  // afe_config_init's auto-scan for the wakenet has come up empty on this
-  // esp-sr build even with the model in the partition; set it explicitly from
-  // the loaded list (filter for the "wn" prefix) and force wakenet on.
+  // afe_config_init auto-selects the wakenet from the loaded list; if none is
+  // present (empty/incompatible model partition), disable wake gracefully.
   if (!cfg->wakenet_model_name) {
     ESP_LOGE(kTag, "no WakeNet model in partition — wake disabled");
     afe_config_free(cfg);
@@ -100,12 +101,20 @@ bool WakeEngine::start() {
 
 void WakeEngine::stop() {
   if (!running_.exchange(false)) return;
-  // Tasks watch running_ and exit on their next tick; join by polling their
-  // handles is overkill — a short settle plus capture release is enough here
-  // since stop() is only called at OTA-quiesce / teardown.
-  vTaskDelay(pdMS_TO_TICKS(50));
-  if (feed_task_) { vTaskDelete(feed_task_); feed_task_ = nullptr; }
-  if (fetch_task_) { vTaskDelete(fetch_task_); fetch_task_ = nullptr; }
+  // JOIN both tasks: they observe running_==false and return within a tick
+  // (feed after its ≤32 ms record_pcm, fetch after its ≤2 s AFE fetch), then
+  // their tramps give feed_exited_/fetch_exited_. Only after BOTH have fully
+  // returned is it safe to destroy the AFE and release the mic — never
+  // vTaskDelete a task that may be mid-WakeNet-inference or inside the
+  // detection callback. The tasks self-delete, so no vTaskDelete here.
+  if (feed_task_ && feed_exited_) {
+    xSemaphoreTake(feed_exited_, pdMS_TO_TICKS(3000));
+    feed_task_ = nullptr;
+  }
+  if (fetch_task_ && fetch_exited_) {
+    xSemaphoreTake(fetch_exited_, pdMS_TO_TICKS(3000));
+    fetch_task_ = nullptr;
+  }
   if (afe_data_ && afe_handle_) {
     afe_if(afe_handle_)->destroy(afe_dat(afe_data_));
   }
@@ -113,13 +122,20 @@ void WakeEngine::stop() {
   afe_handle_ = nullptr;
   if (listening_.exchange(false)) audio_->stop_capture();
   if (feed_paused_) { vSemaphoreDelete(feed_paused_); feed_paused_ = nullptr; }
+  if (feed_exited_) { vSemaphoreDelete(feed_exited_); feed_exited_ = nullptr; }
+  if (fetch_exited_) { vSemaphoreDelete(fetch_exited_); fetch_exited_ = nullptr; }
 }
 
 void WakeEngine::pause() {
   if (!running_.load() || paused_.exchange(true)) return;
-  // Wait for the feed loop to observe paused_ and release the mic, so the
-  // caller can hand record_pcm() to run_mic() as the sole consumer.
-  if (feed_paused_) xSemaphoreTake(feed_paused_, pdMS_TO_TICKS(500));
+  // Drain any stale token first (a previous pause/park could have left one),
+  // then wait for the feed loop to observe paused_ and PARK for THIS pause —
+  // guaranteeing it's out of record_pcm() before we release the mic and hand
+  // it to run_mic() as the sole consumer.
+  if (feed_paused_) {
+    xSemaphoreTake(feed_paused_, 0);  // clear stale
+    xSemaphoreTake(feed_paused_, pdMS_TO_TICKS(500));
+  }
   if (listening_.exchange(false)) audio_->stop_capture();
 }
 
@@ -132,11 +148,17 @@ void WakeEngine::resume() {
 }
 
 void WakeEngine::feed_task_tramp(void* arg) {
-  static_cast<WakeEngine*>(arg)->feed_loop();
+  auto* self = static_cast<WakeEngine*>(arg);
+  self->feed_loop();
+  // Signal stop() the loop has fully returned before self-deleting, so it can
+  // safely free the AFE / release the mic without racing this task.
+  xSemaphoreGive(self->feed_exited_);
   vTaskDelete(nullptr);
 }
 void WakeEngine::fetch_task_tramp(void* arg) {
-  static_cast<WakeEngine*>(arg)->fetch_loop();
+  auto* self = static_cast<WakeEngine*>(arg);
+  self->fetch_loop();
+  xSemaphoreGive(self->fetch_exited_);
   vTaskDelete(nullptr);
 }
 
@@ -145,30 +167,40 @@ void WakeEngine::feed_loop() {
   int16_t* buf = (int16_t*)malloc(n * sizeof(int16_t));
   if (!buf) { ESP_LOGE(kTag, "feed buffer oom"); return; }
 
-  bool parked = false;
+  size_t filled = 0;  // valid samples accumulated toward a full chunk
+  bool parked_for_pause = false;
   while (running_.load()) {
-    if (paused_.load() || (muted_fn_ && muted_fn_())) {
-      if (!parked) {
-        parked = true;
-        // Signal pause() (only meaningful for the paused_ case; harmless for
-        // mute) that the mic is now free.
+    const bool pausing = paused_.load();
+    if (pausing || (muted_fn_ && muted_fn_())) {
+      // Signal pause() ONCE per pause that the mic is now free. Do NOT give
+      // the token for a mute park — pause() must only unblock on a real pause,
+      // or a leftover mute token would let a later pause return while we're
+      // still mid-read.
+      if (pausing && !parked_for_pause) {
+        parked_for_pause = true;
         if (feed_paused_) xSemaphoreGive(feed_paused_);
       }
+      if (!pausing) parked_for_pause = false;
+      filled = 0;  // drop a partial chunk across a pause/mute gap
       vTaskDelay(pdMS_TO_TICKS(30));
       continue;
     }
-    parked = false;
+    parked_for_pause = false;
 
     // The engine owns the mic here — the ONLY record_pcm() caller while
-    // running and not paused. get_feed_chunksize samples per channel; mono.
-    size_t got = audio_->record_pcm(buf, feed_chunk_);
+    // running and not paused. Accumulate until a FULL chunk is available; a
+    // short read must never hand stale/uninitialised tail samples to feed().
+    size_t got = audio_->record_pcm(buf + filled, feed_chunk_ - (int)filled);
     if (got == 0) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+    filled += got;
+    if ((int)filled < feed_chunk_) continue;  // need a whole chunk
+    filled = 0;
+
     // Optional pre-AFE gain: the onboard MEMS mic reads quiet, so a modest
     // boost lifts speech into WakeNet's range. Kept conservative — too much
-    // just amplifies the noise floor equally and hurts the SNR the WebRTC VAD
-    // needs. 1 = off (rely on the AFE's own AGC).
+    // just amplifies the noise floor equally. 1 = off (rely on AFE's AGC).
     if (input_gain_ > 1) {
-      for (int i = 0; i < feed_chunk_; i++) {
+      for (size_t i = 0; i < n; i++) {
         int32_t v = (int32_t)buf[i] * input_gain_;
         if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
         buf[i] = (int16_t)v;
