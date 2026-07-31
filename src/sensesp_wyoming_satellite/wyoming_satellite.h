@@ -272,6 +272,11 @@ class WyomingSatellite {
   size_t probe_head_ = 0;             // next write index
   size_t probe_filled_ = 0;           // valid samples (<= kProbeSamples)
   SemaphoreHandle_t probe_mutex_ = nullptr;
+  // Lock-free privacy kill switch: wake_pcm_clear() sets it so a snapshot
+  // returns nothing IMMEDIATELY, even if it can't grab probe_mutex_ to zero
+  // the ring; the writer clears it when it resumes filling. snapshot() honors
+  // it, so muted audio can never be read back.
+  std::atomic<bool> probe_disabled_{false};
 };
 
 }  // namespace sensesp_wyoming

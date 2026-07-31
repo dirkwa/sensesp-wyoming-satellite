@@ -659,7 +659,10 @@ bool WyomingSatellite::wake_session(int sock) {
       if (v > peak) peak = (uint16_t)v;
     }
     wake_peak_.store(peak);
-    // Tee into the probe ring so /mic_probe can dump exactly this audio.
+    // Tee into the probe ring so /mic_probe can dump exactly this audio. We
+    // only reach here when unmuted (the wake session doesn't stream muted mic
+    // audio), so re-enable the snapshot: this is fresh post-mute capture.
+    probe_disabled_.store(false);
     if (probe_mutex_ &&
         xSemaphoreTake(probe_mutex_, 0) == pdTRUE) {
       if (!probe_buf_) {
@@ -740,6 +743,9 @@ void WyomingSatellite::run_detection_pipeline() {
 
 size_t WyomingSatellite::wake_pcm_snapshot(int16_t* out, size_t max_samples) {
   if (!out || max_samples == 0 || !probe_mutex_) return 0;
+  // Honor the privacy kill switch: while set (mic muted, ring not yet refilled)
+  // never return audio, even if wake_pcm_clear() couldn't zero the ring.
+  if (probe_disabled_.load()) return 0;
   size_t n = 0;
   if (xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) return 0;
   if (probe_buf_ && probe_filled_ > 0) {
@@ -762,6 +768,12 @@ size_t WyomingSatellite::wake_pcm_snapshot(int16_t* out, size_t max_samples) {
 void WyomingSatellite::wake_pcm_clear() {
   // Drop any retained mic PCM (privacy: called when the mic is muted so a
   // later /mic_probe can't surface audio captured before the mute).
+  //
+  // Set the disable flag FIRST and unconditionally: it's lock-free, so the
+  // privacy guarantee holds even if we can't grab probe_mutex_ — snapshot()
+  // returns nothing while it's set. Zeroing the ring under the lock is a
+  // best-effort belt-and-braces; the flag is the guarantee.
+  probe_disabled_.store(true);
   if (!probe_mutex_) return;
   if (xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) return;
   probe_head_ = 0;
