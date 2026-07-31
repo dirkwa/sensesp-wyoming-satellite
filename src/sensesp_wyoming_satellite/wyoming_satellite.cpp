@@ -22,6 +22,7 @@ WyomingSatellite::WyomingSatellite(
   mic_done_ = xSemaphoreCreateBinary();
   server_done_ = xSemaphoreCreateBinary();
   wake_done_ = xSemaphoreCreateBinary();
+  probe_mutex_ = xSemaphoreCreateMutex();
 }
 
 WyomingSatellite::~WyomingSatellite() {
@@ -30,6 +31,8 @@ WyomingSatellite::~WyomingSatellite() {
   if (mic_done_) vSemaphoreDelete(mic_done_);
   if (server_done_) vSemaphoreDelete(server_done_);
   if (wake_done_) vSemaphoreDelete(wake_done_);
+  if (probe_mutex_) vSemaphoreDelete(probe_mutex_);
+  if (probe_buf_) free(probe_buf_);
 }
 
 void WyomingSatellite::start() {
@@ -37,10 +40,31 @@ void WyomingSatellite::start() {
   xTaskCreate(&WyomingSatellite::server_task, "wyoming_sat", 6144, this, 3,
               &server_task_);
   ESP_LOGI(kTag, "Wyoming satellite starting on port %u", config_.port);
-  if (!config_.wake_host.empty()) {
+
+  if (config_.on_device_wake) {
+    // On-device wake: esp-sr AFE + WakeNet reads the mic locally. On a
+    // detection it runs the same pipeline PTT does. Build + configure a local
+    // first; only publish to wake_engine_ once it's live, so /hello never sees
+    // a half-constructed engine. (new can yield nullptr with -fno-exceptions.)
+    WakeEngine* e = new WakeEngine(audio_);
+    if (!e) {
+      ESP_LOGW(kTag, "on-device wake alloc failed — tap-to-talk only");
+    } else {
+      e->set_muted_fn([this] { return mic_muted(); });
+      e->set_on_detect([this] { start_wake_pipeline(); });
+      e->set_input_gain(config_.wake_input_gain);
+      e->set_threshold(config_.wake_threshold);
+      if (e->start()) {
+        wake_engine_.store(e);
+      } else {
+        ESP_LOGW(kTag, "on-device wake unavailable — tap-to-talk only");
+        delete e;
+      }
+    }
+  } else if (!config_.wake_host.empty()) {
     xTaskCreate(&WyomingSatellite::wake_task, "wyoming_wake", 4608, this, 3,
                 &wake_task_);
-    ESP_LOGI(kTag, "Wake mode: streaming to %s:%u", config_.wake_host.c_str(),
+    ESP_LOGI(kTag, "Network wake: streaming to %s:%u", config_.wake_host.c_str(),
              config_.wake_port);
   }
 }
@@ -52,8 +76,14 @@ void WyomingSatellite::stop() {
   if (client_sock_ >= 0) {
     shutdown(client_sock_, SHUT_RDWR);
   }
-  // The wake task blocks in connect()/recv() with short timeouts, so it wakes
-  // on its next tick and exits on running_==false. Join it before freeing.
+  // On-device wake engine: DETACH the pointer before stopping/deleting so a
+  // /hello diagnostics read in flight sees null rather than a freed engine.
+  if (WakeEngine* e = wake_engine_.exchange(nullptr)) {
+    e->stop();  // joins the feed/fetch tasks + releases the mic
+    delete e;
+  }
+  // The network wake task blocks in connect()/recv() with short timeouts, so
+  // it wakes on its next tick and exits on running_==false. Join it first.
   if (wake_task_) {
     if (xSemaphoreTake(wake_done_, pdMS_TO_TICKS(8000)) != pdTRUE) {
       ESP_LOGE(kTag, "wake task did not exit in time — leaking task handle");
@@ -338,6 +368,7 @@ bool WyomingSatellite::on_event(const DecodedEvent& ev) {
     std::string name;
     parse_detection(ev, &name);
     ESP_LOGI(kTag, "wake detection: \"%s\"", name.c_str());
+    wake_detections_.fetch_add(1);
     wake_detected_.store(true);
     return true;
   }
@@ -481,7 +512,9 @@ void WyomingSatellite::run_wake() {
     ESP_LOGI(kTag, "wake service connected %s:%u", config_.wake_host.c_str(),
              config_.wake_port);
     backoff = pdMS_TO_TICKS(1000);  // reset after a good connection
+    wake_connected_.store(true);
     wake_session(sock);
+    wake_connected_.store(false);
     close(sock);
     ESP_LOGI(kTag, "wake service disconnected");
     if (running_.load()) vTaskDelay(pdMS_TO_TICKS(500));
@@ -538,6 +571,7 @@ bool WyomingSatellite::wake_session(int sock) {
     build_audio_start(start, mic_fmt);
     if (!sock_send(start)) return false;
     capturing = true;
+    wake_capturing_.store(true);
     return true;
   };
   auto close_capture = [&]() {
@@ -547,6 +581,7 @@ bool WyomingSatellite::wake_session(int sock) {
     sock_send(stop);
     audio_->stop_capture();
     capturing = false;
+    wake_capturing_.store(false);
   };
 
   bool ok = true;
@@ -603,17 +638,72 @@ bool WyomingSatellite::wake_session(int sock) {
     }
     size_t frames = audio_->record_pcm(buf, kChunkFrames);
     if (frames == 0) continue;
+    // Wake-only digital boost: the analog PGA alone leaves the MEMS mics too
+    // quiet for openWakeWord's model. Scale here (with saturation) so the
+    // stream, the peak gauge and the probe tee all reflect what the detector
+    // receives. The push-to-talk path is untouched (it reads record_pcm
+    // directly and whisper already copes).
+    if (config_.wake_gain > 1.0f) {
+      for (size_t i = 0; i < frames; ++i) {
+        int32_t v = (int32_t)(buf[i] * config_.wake_gain);
+        if (v > 32767) v = 32767;
+        else if (v < -32768) v = -32768;
+        buf[i] = (int16_t)v;
+      }
+    }
+    // Track peak amplitude so /hello can tell "mic silent" from "mic fine but
+    // model not matching".
+    uint16_t peak = wake_peak_.load();
+    for (size_t i = 0; i < frames; ++i) {
+      int v = buf[i] < 0 ? -buf[i] : buf[i];
+      if (v > peak) peak = (uint16_t)v;
+    }
+    wake_peak_.store(peak);
+    // Tee into the probe ring so /mic_probe can dump exactly this audio.
+    if (probe_mutex_ &&
+        xSemaphoreTake(probe_mutex_, 0) == pdTRUE) {
+      if (!probe_buf_) {
+        probe_buf_ = (int16_t*)malloc(kProbeSamples * sizeof(int16_t));
+      }
+      if (probe_buf_) {
+        for (size_t i = 0; i < frames; ++i) {
+          probe_buf_[probe_head_] = buf[i];
+          probe_head_ = (probe_head_ + 1) % kProbeSamples;
+          if (probe_filled_ < kProbeSamples) probe_filled_++;
+        }
+      }
+      xSemaphoreGive(probe_mutex_);
+    }
     std::vector<uint8_t> chunk;
     build_audio_chunk(chunk, mic_fmt, buf, frames);
     if (!sock_send(chunk)) {
       ok = false;
       break;
     }
+    wake_chunks_.fetch_add(1);
   }
 
   close_capture();
   free(buf);
   return ok;
+}
+
+void WyomingSatellite::start_wake_pipeline() {
+  // Called from the WakeEngine fetch task on a detection. Pause the engine so
+  // it releases the mic (single consumer), play the awake cue, run the same
+  // pipeline PTT does, then resume the engine to listen for the next word.
+  if (!client_connected_.load() || !armed_) {
+    ESP_LOGW(kTag, "wake ignored (no orchestrator / not armed)");
+    return;
+  }
+  if (mic_muted()) return;
+  // Runs on the engine's own fetch task, so the engine outlives this call;
+  // snapshot the atomic once for the type.
+  WakeEngine* e = wake_engine_.load();
+  if (e) e->pause();  // frees the mic for run_mic()
+  if (config_.awake_cue) play_done_tone();
+  run_detection_pipeline();
+  if (e) e->resume();
 }
 
 void WyomingSatellite::run_detection_pipeline() {
@@ -646,6 +736,27 @@ void WyomingSatellite::run_detection_pipeline() {
   }
   set_ptt_held(false);
   pipeline_active_.store(false);
+}
+
+size_t WyomingSatellite::wake_pcm_snapshot(int16_t* out, size_t max_samples) {
+  if (!out || max_samples == 0 || !probe_mutex_) return 0;
+  size_t n = 0;
+  if (xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) return 0;
+  if (probe_buf_ && probe_filled_ > 0) {
+    n = probe_filled_ < max_samples ? probe_filled_ : max_samples;
+    // Oldest sample first. head points past the newest; the ring holds
+    // probe_filled_ samples ending at head-1.
+    size_t start = (probe_head_ + kProbeSamples - probe_filled_) % kProbeSamples;
+    // We want the newest n samples: shift start forward if truncating.
+    if (probe_filled_ > n) {
+      start = (probe_head_ + kProbeSamples - n) % kProbeSamples;
+    }
+    for (size_t i = 0; i < n; ++i) {
+      out[i] = probe_buf_[(start + i) % kProbeSamples];
+    }
+  }
+  xSemaphoreGive(probe_mutex_);
+  return n;
 }
 
 void WyomingSatellite::play_done_tone() {
