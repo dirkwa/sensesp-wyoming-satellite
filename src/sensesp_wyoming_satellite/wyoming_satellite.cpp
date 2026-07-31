@@ -439,6 +439,11 @@ void WyomingSatellite::run_mic() {
   const TickType_t kReleaseTailTicks = pdMS_TO_TICKS(1200);
   TickType_t release_at = 0;  // 0 = still held
   while (listening_.load() && running_.load() && client_connected_.load()) {
+    // Muting must stop the mic NOW — abort before the next record_pcm()/send,
+    // and skip the release tail, so no samples reach the orchestrator after
+    // the user hits mute (set_ptt_held(false) alone would still stream the
+    // 1.2 s tail). The audio-stop below closes the pipeline cleanly.
+    if (mic_muted()) break;
     if (!ptt_held_.load() && release_at == 0) {
       release_at = xTaskGetTickCount();  // start the tail on release
     }
