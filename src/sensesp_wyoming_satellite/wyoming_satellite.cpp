@@ -439,6 +439,11 @@ void WyomingSatellite::run_mic() {
   const TickType_t kReleaseTailTicks = pdMS_TO_TICKS(1200);
   TickType_t release_at = 0;  // 0 = still held
   while (listening_.load() && running_.load() && client_connected_.load()) {
+    // Muting must stop the mic NOW — abort before the next record_pcm()/send,
+    // and skip the release tail, so no samples reach the orchestrator after
+    // the user hits mute (set_ptt_held(false) alone would still stream the
+    // 1.2 s tail). The audio-stop below closes the pipeline cleanly.
+    if (mic_muted()) break;
     if (!ptt_held_.load() && release_at == 0) {
       release_at = xTaskGetTickCount();  // start the tail on release
     }
@@ -659,13 +664,26 @@ bool WyomingSatellite::wake_session(int sock) {
       if (v > peak) peak = (uint16_t)v;
     }
     wake_peak_.store(peak);
-    // Tee into the probe ring so /mic_probe can dump exactly this audio.
+    // Tee into the probe ring so /mic_probe can dump exactly this audio. We
+    // only reach here when unmuted (the wake session doesn't stream muted mic
+    // audio). Re-enabling the snapshot is done INSIDE the lock, and only after
+    // discarding any pre-mute samples that wake_pcm_clear() may have failed to
+    // zero — so a snapshot never sees pre-mute audio, and a delayed in-flight
+    // chunk can't flip the kill switch back on before the ring is clean.
     if (probe_mutex_ &&
         xSemaphoreTake(probe_mutex_, 0) == pdTRUE) {
       if (!probe_buf_) {
         probe_buf_ = (int16_t*)malloc(kProbeSamples * sizeof(int16_t));
       }
       if (probe_buf_) {
+        if (probe_disabled_.load()) {
+          // First post-clear write while still disabled: drop whatever the
+          // clear couldn't reach, then re-enable — all under the lock, so a
+          // concurrent snapshot sees either "disabled" or a freshly-reset ring.
+          probe_head_ = 0;
+          probe_filled_ = 0;
+          probe_disabled_.store(false);
+        }
         for (size_t i = 0; i < frames; ++i) {
           probe_buf_[probe_head_] = buf[i];
           probe_head_ = (probe_head_ + 1) % kProbeSamples;
@@ -740,9 +758,15 @@ void WyomingSatellite::run_detection_pipeline() {
 
 size_t WyomingSatellite::wake_pcm_snapshot(int16_t* out, size_t max_samples) {
   if (!out || max_samples == 0 || !probe_mutex_) return 0;
+  // Fast lock-free reject: wake_pcm_clear() sets the flag first, so a muted mic
+  // is refused immediately even if the ring couldn't be zeroed.
+  if (probe_disabled_.load()) return 0;
   size_t n = 0;
   if (xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) return 0;
-  if (probe_buf_ && probe_filled_ > 0) {
+  // Re-check UNDER the lock: the writer flips the flag off + resets the ring
+  // atomically w.r.t. this mutex, so this guarantees we never read pre-mute
+  // samples racing a just-cleared/just-re-enabled ring.
+  if (!probe_disabled_.load() && probe_buf_ && probe_filled_ > 0) {
     n = probe_filled_ < max_samples ? probe_filled_ : max_samples;
     // Oldest sample first. head points past the newest; the ring holds
     // probe_filled_ samples ending at head-1.
@@ -757,6 +781,22 @@ size_t WyomingSatellite::wake_pcm_snapshot(int16_t* out, size_t max_samples) {
   }
   xSemaphoreGive(probe_mutex_);
   return n;
+}
+
+void WyomingSatellite::wake_pcm_clear() {
+  // Drop any retained mic PCM (privacy: called when the mic is muted so a
+  // later /mic_probe can't surface audio captured before the mute).
+  //
+  // Set the disable flag FIRST and unconditionally: it's lock-free, so the
+  // privacy guarantee holds even if we can't grab probe_mutex_ — snapshot()
+  // returns nothing while it's set. Zeroing the ring under the lock is a
+  // best-effort belt-and-braces; the flag is the guarantee.
+  probe_disabled_.store(true);
+  if (!probe_mutex_) return;
+  if (xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) return;
+  probe_head_ = 0;
+  probe_filled_ = 0;
+  xSemaphoreGive(probe_mutex_);
 }
 
 void WyomingSatellite::play_done_tone() {

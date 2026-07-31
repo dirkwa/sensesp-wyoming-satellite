@@ -162,6 +162,9 @@ class WyomingSatellite {
   // (guarded by probe_mutex_). NOTE: the probe ring is filled only by the
   // NETWORK wake path — on-device wake returns an empty snapshot.
   size_t wake_pcm_snapshot(int16_t* out, size_t max_samples);
+  // Drop any retained mic PCM. Call when the mic is muted so /mic_probe can't
+  // surface audio captured before the mute (privacy).
+  void wake_pcm_clear();
 
   // Optional UI hook: called (from the satellite task) with the recognised
   // text when a transcript arrives, so a widget can toast it. The callback
@@ -269,6 +272,11 @@ class WyomingSatellite {
   size_t probe_head_ = 0;             // next write index
   size_t probe_filled_ = 0;           // valid samples (<= kProbeSamples)
   SemaphoreHandle_t probe_mutex_ = nullptr;
+  // Lock-free privacy kill switch: wake_pcm_clear() sets it so a snapshot
+  // returns nothing IMMEDIATELY, even if it can't grab probe_mutex_ to zero
+  // the ring; the writer clears it when it resumes filling. snapshot() honors
+  // it, so muted audio can never be read back.
+  std::atomic<bool> probe_disabled_{false};
 };
 
 }  // namespace sensesp_wyoming
