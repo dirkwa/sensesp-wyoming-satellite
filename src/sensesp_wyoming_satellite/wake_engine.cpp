@@ -143,8 +143,16 @@ void WakeEngine::resume() {
   if (!running_.load() || !paused_.exchange(false)) return;
   audio_->start_capture();
   listening_.store(true);
-  // Drop any stale AFE buffer so a mid-pipeline word fragment doesn't linger.
-  if (afe_data_ && afe_handle_) afe_if(afe_handle_)->reset_buffer(afe_dat(afe_data_));
+  // Re-arm WakeNet cleanly for the next word: reset the AFE input ring (drop
+  // any mid-pipeline fragment) and toggle wakenet off→on so its detection
+  // state doesn't stay latched from the word that just fired.
+  if (afe_data_ && afe_handle_) {
+    const esp_afe_sr_iface_t* h = afe_if(afe_handle_);
+    esp_afe_sr_data_t* d = afe_dat(afe_data_);
+    h->reset_buffer(d);
+    if (h->disable_wakenet) h->disable_wakenet(d);
+    if (h->enable_wakenet) h->enable_wakenet(d);
+  }
 }
 
 void WakeEngine::feed_task_tramp(void* arg) {
