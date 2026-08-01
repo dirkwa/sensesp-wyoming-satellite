@@ -53,6 +53,17 @@ struct WyomingSatelliteConfig {
   // 16000 if you constrain the orchestrator to 16 kHz voices.
   uint32_t snd_rate = 22050;
 
+  // Digital gain applied to the OUTBOUND STT mic stream (run_mic → audio-chunk)
+  // only — independent of the wake feed's gain. The panel's MEMS mic reads
+  // quiet; the orchestrator's energy-gate endpointer treats a chunk as speech
+  // only above an absolute RMS floor (~700), so un-boosted panel audio never
+  // trips end-of-utterance and the stream runs to its safety cap (~20 s) every
+  // time. Lifting the stream here makes the gate fire ~1 s after you stop
+  // talking. 1 = off. Applied with a saturating clamp (no wrap on loud peaks).
+  // Keep modest: this also raises what whisper transcribes, so too much just
+  // amplifies the noise floor.
+  int mic_stream_gain = 3;
+
   // --- Hands-free wake word ------------------------------------------------
   // Two mutually exclusive back-ends:
   //

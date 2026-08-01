@@ -457,6 +457,18 @@ void WyomingSatellite::run_mic() {
     }
     size_t frames = audio_->record_pcm(buf, kChunkFrames);
     if (frames == 0) continue;
+    // Boost the quiet panel mic so the orchestrator's energy-gate endpointer
+    // registers speech (RMS floor ~700) and ends the utterance ~1 s after you
+    // stop talking, instead of running to the safety cap. Saturating clamp so
+    // loud peaks don't wrap. gain <= 1 leaves the samples untouched.
+    if (config_.mic_stream_gain > 1) {
+      for (size_t i = 0; i < frames; i++) {
+        int32_t v = (int32_t)buf[i] * config_.mic_stream_gain;
+        if (v > 32767) v = 32767;
+        else if (v < -32768) v = -32768;
+        buf[i] = (int16_t)v;
+      }
+    }
     std::vector<uint8_t> chunk;
     build_audio_chunk(chunk, mic_fmt, buf, frames);
     if (!send_all(chunk)) break;
