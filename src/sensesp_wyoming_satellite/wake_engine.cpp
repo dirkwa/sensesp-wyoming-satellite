@@ -125,14 +125,35 @@ void WakeEngine::stop() {
   if (feed_paused_) { vSemaphoreDelete(feed_paused_); feed_paused_ = nullptr; }
   if (feed_exited_) { vSemaphoreDelete(feed_exited_); feed_exited_ = nullptr; }
   if (fetch_exited_) { vSemaphoreDelete(fetch_exited_); fetch_exited_ = nullptr; }
+  // The probe buffer/mutex can be touched by pcm_snapshot() on ANOTHER task
+  // (the /hello httpd path), which stop() hasn't joined. Wait out any in-flight
+  // snapshot before freeing, or a /mic_probe racing shutdown would read freed
+  // memory. Reset the ring metadata too, so a restarted engine doesn't report
+  // a stale fill count over a fresh (or null) buffer.
+  for (int i = 0; i < 100 && snapshot_active_.load(); i++) {
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
   if (probe_mutex_) { vSemaphoreDelete(probe_mutex_); probe_mutex_ = nullptr; }
   if (probe_) { free(probe_); probe_ = nullptr; }
+  probe_head_ = 0;
+  probe_filled_ = 0;
 }
 
 size_t WakeEngine::pcm_snapshot(int16_t* out, size_t max_samples) {
-  if (!out || max_samples == 0 || !probe_mutex_) return 0;
+  if (!out || max_samples == 0) return 0;
+  // Mark the snapshot in flight BEFORE touching the probe, so stop() (on
+  // another task) waits for us before freeing probe_mutex_/probe_. Re-check
+  // running_ after: if stop() already began teardown, back out cleanly.
+  snapshot_active_.store(true);
+  if (!running_.load() || !probe_mutex_) {
+    snapshot_active_.store(false);
+    return 0;
+  }
   size_t n = 0;
-  if (xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) return 0;
+  if (xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) {
+    snapshot_active_.store(false);
+    return 0;
+  }
   if (probe_ && probe_filled_ > 0) {
     n = probe_filled_ < max_samples ? probe_filled_ : max_samples;
     size_t start = (probe_head_ + kProbeSamples - n) % kProbeSamples;
@@ -140,7 +161,16 @@ size_t WakeEngine::pcm_snapshot(int16_t* out, size_t max_samples) {
       out[i] = probe_[(start + i) % kProbeSamples];
   }
   xSemaphoreGive(probe_mutex_);
+  snapshot_active_.store(false);
   return n;
+}
+
+void WakeEngine::clear_probe() {
+  if (!probe_mutex_) return;
+  if (xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) return;
+  probe_head_ = 0;
+  probe_filled_ = 0;
+  xSemaphoreGive(probe_mutex_);
 }
 
 void WakeEngine::pause() {

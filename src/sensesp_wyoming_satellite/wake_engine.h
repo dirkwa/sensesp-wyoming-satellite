@@ -71,6 +71,9 @@ class WakeEngine {
   // (post-gain) into `out` (up to max_samples), newest last. Returns the count
   // copied. Lets /mic_probe dump what the detector actually sees on-device.
   size_t pcm_snapshot(int16_t* out, size_t max_samples);
+  // Drop any retained probe PCM (privacy: called when the mic is muted). The
+  // feed loop stops filling the ring while muted and clears it on this call.
+  void clear_probe();
 
  private:
   static void feed_task_tramp(void* arg);
@@ -114,6 +117,9 @@ class WakeEngine {
   size_t probe_head_ = 0;
   size_t probe_filled_ = 0;
   SemaphoreHandle_t probe_mutex_ = nullptr;
+  // Set while a pcm_snapshot() is copying, so stop() waits it out before
+  // freeing the probe. Lets a /mic_probe race shutdown safely.
+  std::atomic<bool> snapshot_active_{false};
 };
 
 }  // namespace sensesp_wyoming
