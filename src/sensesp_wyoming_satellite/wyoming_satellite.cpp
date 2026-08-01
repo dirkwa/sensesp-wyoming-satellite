@@ -757,10 +757,17 @@ void WyomingSatellite::run_detection_pipeline() {
 }
 
 size_t WyomingSatellite::wake_pcm_snapshot(int16_t* out, size_t max_samples) {
-  if (!out || max_samples == 0 || !probe_mutex_) return 0;
+  if (!out || max_samples == 0) return 0;
   // Fast lock-free reject: wake_pcm_clear() sets the flag first, so a muted mic
   // is refused immediately even if the ring couldn't be zeroed.
   if (probe_disabled_.load()) return 0;
+  // On-device wake fills its own probe ring (the network ring below is only
+  // fed by wake_session, which isn't running on the on-device path).
+  if (config_.on_device_wake) {
+    WakeEngine* e = wake_engine_.load();
+    return e ? e->pcm_snapshot(out, max_samples) : 0;
+  }
+  if (!probe_mutex_) return 0;
   size_t n = 0;
   if (xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) return 0;
   // Re-check UNDER the lock: the writer flips the flag off + resets the ring

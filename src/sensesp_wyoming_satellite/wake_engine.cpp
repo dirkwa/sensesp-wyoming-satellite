@@ -31,6 +31,7 @@ bool WakeEngine::start() {
   feed_paused_ = xSemaphoreCreateBinary();
   feed_exited_ = xSemaphoreCreateBinary();
   fetch_exited_ = xSemaphoreCreateBinary();
+  probe_mutex_ = xSemaphoreCreateMutex();
 
   // NOTE: do NOT dereference srmodel_list_t fields here — mirror the esp-sr
   // Arduino HAL, which passes the opaque list straight to afe_config_init()
@@ -124,6 +125,22 @@ void WakeEngine::stop() {
   if (feed_paused_) { vSemaphoreDelete(feed_paused_); feed_paused_ = nullptr; }
   if (feed_exited_) { vSemaphoreDelete(feed_exited_); feed_exited_ = nullptr; }
   if (fetch_exited_) { vSemaphoreDelete(fetch_exited_); fetch_exited_ = nullptr; }
+  if (probe_mutex_) { vSemaphoreDelete(probe_mutex_); probe_mutex_ = nullptr; }
+  if (probe_) { free(probe_); probe_ = nullptr; }
+}
+
+size_t WakeEngine::pcm_snapshot(int16_t* out, size_t max_samples) {
+  if (!out || max_samples == 0 || !probe_mutex_) return 0;
+  size_t n = 0;
+  if (xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) return 0;
+  if (probe_ && probe_filled_ > 0) {
+    n = probe_filled_ < max_samples ? probe_filled_ : max_samples;
+    size_t start = (probe_head_ + kProbeSamples - n) % kProbeSamples;
+    for (size_t i = 0; i < n; i++)
+      out[i] = probe_[(start + i) % kProbeSamples];
+  }
+  xSemaphoreGive(probe_mutex_);
+  return n;
 }
 
 void WakeEngine::pause() {
@@ -213,6 +230,19 @@ void WakeEngine::feed_loop() {
         if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
         buf[i] = (int16_t)v;
       }
+    }
+    // Tee the exact post-gain PCM into the diagnostic ring (best-effort, non-
+    // blocking) so /mic_probe can dump what WakeNet actually sees on-device.
+    if (probe_mutex_ && xSemaphoreTake(probe_mutex_, 0) == pdTRUE) {
+      if (!probe_) probe_ = (int16_t*)malloc(kProbeSamples * sizeof(int16_t));
+      if (probe_) {
+        for (int i = 0; i < feed_chunk_; i++) {
+          probe_[probe_head_] = buf[i];
+          probe_head_ = (probe_head_ + 1) % kProbeSamples;
+          if (probe_filled_ < kProbeSamples) probe_filled_++;
+        }
+      }
+      xSemaphoreGive(probe_mutex_);
     }
     afe_if(afe_handle_)->feed(afe_dat(afe_data_), buf);
     // Match Espressif's HAL cadence: a short yield after each feed keeps the

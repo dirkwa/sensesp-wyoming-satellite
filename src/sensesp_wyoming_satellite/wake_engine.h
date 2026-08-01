@@ -67,6 +67,11 @@ class WakeEngine {
   uint32_t detections() const { return detections_.load(); }
   const char* word() const { return word_; }
 
+  // Diagnostic: copy the most recent ~2 s of the EXACT PCM fed to WakeNet
+  // (post-gain) into `out` (up to max_samples), newest last. Returns the count
+  // copied. Lets /mic_probe dump what the detector actually sees on-device.
+  size_t pcm_snapshot(int16_t* out, size_t max_samples);
+
  private:
   static void feed_task_tramp(void* arg);
   static void fetch_task_tramp(void* arg);
@@ -102,6 +107,13 @@ class WakeEngine {
   std::atomic<bool> paused_{false};
   std::atomic<bool> listening_{false};
   std::atomic<uint32_t> detections_{0};
+
+  // Diagnostic probe ring: the last ~2 s of post-gain PCM fed to WakeNet.
+  static constexpr size_t kProbeSamples = 32000;  // 2 s @ 16 kHz
+  int16_t* probe_ = nullptr;
+  size_t probe_head_ = 0;
+  size_t probe_filled_ = 0;
+  SemaphoreHandle_t probe_mutex_ = nullptr;
 };
 
 }  // namespace sensesp_wyoming
