@@ -117,9 +117,11 @@ class WakeEngine {
   size_t probe_head_ = 0;
   size_t probe_filled_ = 0;
   SemaphoreHandle_t probe_mutex_ = nullptr;
-  // Set while a pcm_snapshot() is copying, so stop() waits it out before
-  // freeing the probe. Lets a /mic_probe race shutdown safely.
-  std::atomic<bool> snapshot_active_{false};
+  // Count of probe operations (pcm_snapshot / clear_probe) currently touching
+  // probe_mutex_/probe_ from OTHER tasks (the /hello httpd path, the mic-mute
+  // widget). stop() waits for this to reach zero before freeing them, so a
+  // probe call racing engine teardown can't use freed memory.
+  std::atomic<int> probe_busy_{0};
 };
 
 }  // namespace sensesp_wyoming
