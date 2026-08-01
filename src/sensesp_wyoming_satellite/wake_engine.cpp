@@ -31,6 +31,7 @@ bool WakeEngine::start() {
   feed_paused_ = xSemaphoreCreateBinary();
   feed_exited_ = xSemaphoreCreateBinary();
   fetch_exited_ = xSemaphoreCreateBinary();
+  probe_mutex_ = xSemaphoreCreateMutex();
 
   // NOTE: do NOT dereference srmodel_list_t fields here — mirror the esp-sr
   // Arduino HAL, which passes the opaque list straight to afe_config_init()
@@ -124,6 +125,56 @@ void WakeEngine::stop() {
   if (feed_paused_) { vSemaphoreDelete(feed_paused_); feed_paused_ = nullptr; }
   if (feed_exited_) { vSemaphoreDelete(feed_exited_); feed_exited_ = nullptr; }
   if (fetch_exited_) { vSemaphoreDelete(fetch_exited_); fetch_exited_ = nullptr; }
+  // The probe buffer/mutex are touched by pcm_snapshot()/clear_probe() on OTHER
+  // tasks (the /hello httpd path, the mic-mute widget) that stop() hasn't
+  // joined. running_ was cleared at the top of stop(); those callers re-check
+  // running_ under probe_busy_, so any that started after see false and bail.
+  // Wait for probe_busy_ to drain (a snapshot copies ≤2 s of PCM, bounded) so
+  // none is mid-access before we free the handles. Then reset the ring
+  // metadata so a restarted engine can't report a stale fill over a fresh
+  // (or null) buffer.
+  for (int i = 0; i < 250 && probe_busy_.load() > 0; i++) {
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+  if (probe_mutex_) { vSemaphoreDelete(probe_mutex_); probe_mutex_ = nullptr; }
+  if (probe_) { free(probe_); probe_ = nullptr; }
+  probe_head_ = 0;
+  probe_filled_ = 0;
+}
+
+size_t WakeEngine::pcm_snapshot(int16_t* out, size_t max_samples) {
+  if (!out || max_samples == 0) return 0;
+  // Register as busy BEFORE touching the probe, so stop() (on another task)
+  // waits for us before freeing probe_mutex_/probe_. Then re-check running_:
+  // if stop() already cleared it, back out — stop() will observe probe_busy_
+  // and wait, so the handles are still valid for this check.
+  probe_busy_.fetch_add(1);
+  size_t n = 0;
+  if (running_.load() && probe_mutex_ &&
+      xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) == pdTRUE) {
+    if (probe_ && probe_filled_ > 0) {
+      n = probe_filled_ < max_samples ? probe_filled_ : max_samples;
+      size_t start = (probe_head_ + kProbeSamples - n) % kProbeSamples;
+      for (size_t i = 0; i < n; i++)
+        out[i] = probe_[(start + i) % kProbeSamples];
+    }
+    xSemaphoreGive(probe_mutex_);
+  }
+  probe_busy_.fetch_sub(1);
+  return n;
+}
+
+void WakeEngine::clear_probe() {
+  // Same busy-guard as pcm_snapshot: this runs on the mic-mute widget task and
+  // must not touch probe_mutex_/probe_ after stop() frees them.
+  probe_busy_.fetch_add(1);
+  if (running_.load() && probe_mutex_ &&
+      xSemaphoreTake(probe_mutex_, pdMS_TO_TICKS(200)) == pdTRUE) {
+    probe_head_ = 0;
+    probe_filled_ = 0;
+    xSemaphoreGive(probe_mutex_);
+  }
+  probe_busy_.fetch_sub(1);
 }
 
 void WakeEngine::pause() {
@@ -213,6 +264,19 @@ void WakeEngine::feed_loop() {
         if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
         buf[i] = (int16_t)v;
       }
+    }
+    // Tee the exact post-gain PCM into the diagnostic ring (best-effort, non-
+    // blocking) so /mic_probe can dump what WakeNet actually sees on-device.
+    if (probe_mutex_ && xSemaphoreTake(probe_mutex_, 0) == pdTRUE) {
+      if (!probe_) probe_ = (int16_t*)malloc(kProbeSamples * sizeof(int16_t));
+      if (probe_) {
+        for (int i = 0; i < feed_chunk_; i++) {
+          probe_[probe_head_] = buf[i];
+          probe_head_ = (probe_head_ + 1) % kProbeSamples;
+          if (probe_filled_ < kProbeSamples) probe_filled_++;
+        }
+      }
+      xSemaphoreGive(probe_mutex_);
     }
     afe_if(afe_handle_)->feed(afe_dat(afe_data_), buf);
     // Match Espressif's HAL cadence: a short yield after each feed keeps the
