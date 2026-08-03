@@ -26,6 +26,19 @@ esp_afe_sr_data_t* afe_dat(void* d) {
 
 WakeEngine::~WakeEngine() { stop(); }
 
+// Route capture start/stop to the mono or 2ch handle to match the AFE format.
+// The wake engine owns whichever handle it opened for its whole run; the STT
+// pipeline always uses the mono handle (record_pcm) and never overlaps (pause()
+// releases ours first), so the two handles are never open at once.
+void WakeEngine::capture_start() {
+  if (dual_mic_) audio_->start_capture2();
+  else audio_->start_capture();
+}
+void WakeEngine::capture_stop() {
+  if (dual_mic_) audio_->stop_capture2();
+  else audio_->stop_capture();
+}
+
 bool WakeEngine::start() {
   if (running_.exchange(true)) return true;
   feed_paused_ = xSemaphoreCreateBinary();
@@ -45,9 +58,16 @@ bool WakeEngine::start() {
     return false;
   }
 
-  // Single mic, no reference channel: input format "M" (one mic channel).
+  // Feed one mic ("M") or both ("MM") depending on what the board exposes. The
+  // panel has two live mics (ES7210 MIC1|MIC2); "MM" lets the AFE apply noise
+  // suppression / beamforming across them, which lifts far-field wake SNR over
+  // the single-mic feed. No reference channel is wired (the DAC out isn't
+  // routed back into an ADC input), so "MMR"/AEC isn't available. Boards
+  // without a 2ch path (supports_dual_mic()==false) stay on "M".
+  dual_mic_ = audio_ && audio_->supports_dual_mic();
+  const char* afe_format = dual_mic_ ? "MM" : "M";
   afe_config_t* cfg =
-      afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
+      afe_config_init(afe_format, models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
   if (!cfg) {
     ESP_LOGE(kTag, "afe_config_init failed — wake disabled");
     running_.store(false);
@@ -69,7 +89,7 @@ bool WakeEngine::start() {
   cfg->vad_init = false;
   const esp_afe_sr_iface_t* handle = esp_afe_handle_from_config(cfg);
   esp_afe_sr_data_t* data = handle ? handle->create_from_config(cfg) : nullptr;
-  ESP_LOGI(kTag, "AFE wakenet '%s'", word_);
+  ESP_LOGI(kTag, "AFE wakenet '%s' (format %s)", word_, afe_format);
   afe_config_free(cfg);
   if (!data) {
     ESP_LOGE(kTag, "AFE create failed — on-device wake disabled");
@@ -86,7 +106,7 @@ bool WakeEngine::start() {
     handle->set_wakenet_threshold(data, 1, threshold_);
   }
 
-  audio_->start_capture();
+  capture_start();
   listening_.store(true);
 
   // Feed + fetch on core 0 (SK WS / LVGL live on the app core). Feed needs a
@@ -121,7 +141,7 @@ void WakeEngine::stop() {
   }
   afe_data_ = nullptr;
   afe_handle_ = nullptr;
-  if (listening_.exchange(false)) audio_->stop_capture();
+  if (listening_.exchange(false)) capture_stop();
   if (feed_paused_) { vSemaphoreDelete(feed_paused_); feed_paused_ = nullptr; }
   if (feed_exited_) { vSemaphoreDelete(feed_exited_); feed_exited_ = nullptr; }
   if (fetch_exited_) { vSemaphoreDelete(fetch_exited_); fetch_exited_ = nullptr; }
@@ -187,12 +207,12 @@ void WakeEngine::pause() {
     xSemaphoreTake(feed_paused_, 0);  // clear stale
     xSemaphoreTake(feed_paused_, pdMS_TO_TICKS(500));
   }
-  if (listening_.exchange(false)) audio_->stop_capture();
+  if (listening_.exchange(false)) capture_stop();
 }
 
 void WakeEngine::resume() {
   if (!running_.load() || !paused_.exchange(false)) return;
-  audio_->start_capture();
+  capture_start();
   listening_.store(true);
   // Re-arm WakeNet cleanly for the next word: reset the AFE input ring (drop
   // any mid-pipeline fragment) and toggle wakenet off→on so its detection
@@ -246,10 +266,16 @@ void WakeEngine::feed_loop() {
     }
     parked_for_pause = false;
 
-    // The engine owns the mic here — the ONLY record_pcm() caller while
-    // running and not paused. Accumulate until a FULL chunk is available; a
-    // short read must never hand stale/uninitialised tail samples to feed().
-    size_t got = audio_->record_pcm(buf + filled, feed_chunk_ - (int)filled);
+    // The engine owns the mic here — the ONLY capture caller while running and
+    // not paused. Accumulate until a FULL chunk (feed_chunk_ FRAMES) is
+    // available; a short read must never hand stale/uninitialised tail samples
+    // to feed(). `filled` counts FRAMES; with dual mic each frame is 2
+    // interleaved samples, so the buffer offset is filled * feed_channels_.
+    size_t got =
+        dual_mic_
+            ? audio_->record_pcm2(buf + filled * feed_channels_,
+                                  feed_chunk_ - (int)filled)
+            : audio_->record_pcm(buf + filled, feed_chunk_ - (int)filled);
     if (got == 0) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
     filled += got;
     if ((int)filled < feed_chunk_) continue;  // need a whole chunk
@@ -265,13 +291,17 @@ void WakeEngine::feed_loop() {
         buf[i] = (int16_t)v;
       }
     }
-    // Tee the exact post-gain PCM into the diagnostic ring (best-effort, non-
+    // Tee the post-gain PCM into the diagnostic ring (best-effort, non-
     // blocking) so /mic_probe can dump what WakeNet actually sees on-device.
+    // Always store feed_chunk_ FRAMES of a single mic (MIC1) — with dual mic
+    // the buffer is 2ch interleaved, so stride by feed_channels_ and keep only
+    // the first channel. This makes the probe a clean single-mic view whether
+    // the feed is "M" or "MM".
     if (probe_mutex_ && xSemaphoreTake(probe_mutex_, 0) == pdTRUE) {
       if (!probe_) probe_ = (int16_t*)malloc(kProbeSamples * sizeof(int16_t));
       if (probe_) {
         for (int i = 0; i < feed_chunk_; i++) {
-          probe_[probe_head_] = buf[i];
+          probe_[probe_head_] = buf[i * feed_channels_];
           probe_head_ = (probe_head_ + 1) % kProbeSamples;
           if (probe_filled_ < kProbeSamples) probe_filled_++;
         }
