@@ -826,6 +826,18 @@ void WyomingSatellite::wake_pcm_clear() {
   xSemaphoreGive(probe_mutex_);
 }
 
+bool WyomingSatellite::probe_mic_levels(
+    sensesp_cockpit_display::AudioDriver::MicLevels& out) {
+  if (!audio_) return false;
+  // On-device wake holds the mic continuously; pause its feed so the probe is
+  // the sole reader (it re-opens the ADC), then resume regardless of outcome.
+  WakeEngine* e = config_.on_device_wake ? wake_engine_.load() : nullptr;
+  if (e) e->pause();
+  bool ok = audio_->probe_mic_channels(out);
+  if (e) e->resume();
+  return ok;
+}
+
 void WyomingSatellite::play_done_tone() {
   // Short confirmation blip so the user knows the utterance was captured.
   const uint32_t rate = 16000;

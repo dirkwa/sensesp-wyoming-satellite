@@ -177,6 +177,12 @@ class WyomingSatellite {
   // surface audio captured before the mute (privacy).
   void wake_pcm_clear();
 
+  // Diagnostic: measure the level of all four ES7210 mic inputs to find which
+  // one(s) carry a live mic. Pauses on-device wake capture so the probe is the
+  // sole mic reader, runs the driver's per-channel probe, then resumes wake.
+  // Returns false if the driver has no probe path. Blocks ~1 s.
+  bool probe_mic_levels(sensesp_cockpit_display::AudioDriver::MicLevels& out);
+
   // Optional UI hook: called (from the satellite task) with the recognised
   // text when a transcript arrives, so a widget can toast it. The callback
   // must not block. Null by default.
