@@ -456,7 +456,17 @@ void WyomingSatellite::run_mic() {
       break;
     }
     size_t frames = audio_->record_pcm(buf, kChunkFrames);
-    if (frames == 0) continue;
+    if (frames == 0) {
+      // Failing read: back off instead of spinning. Unlike the wake loop this
+      // can't wedge forever (the safety cap above ends the stream), but a bare
+      // continue still busy-loops a whole utterance's worth of CPU against a
+      // dead handle. No reopen attempt here: the capture is refcounted and the
+      // wake engine may hold a reference too, so a close/reopen from inside
+      // this stream could disturb the other consumer. Ending the utterance and
+      // letting the caller re-open is the safer recovery.
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
     // Boost the quiet panel mic so the orchestrator's energy-gate endpointer
     // registers speech (RMS floor ~700) and ends the utterance ~1 s after you
     // stop talking, instead of running to the safety cap. Saturating clamp so
