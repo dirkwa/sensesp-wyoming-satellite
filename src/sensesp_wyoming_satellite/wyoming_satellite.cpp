@@ -456,7 +456,17 @@ void WyomingSatellite::run_mic() {
       break;
     }
     size_t frames = audio_->record_pcm(buf, kChunkFrames);
-    if (frames == 0) continue;
+    if (frames == 0) {
+      // Failing read: back off instead of spinning. Unlike the wake loop this
+      // can't wedge forever (the safety cap above ends the stream), but a bare
+      // continue still busy-loops a whole utterance's worth of CPU against a
+      // dead handle. No reopen attempt here: the capture is refcounted and the
+      // wake engine may hold a reference too, so a close/reopen from inside
+      // this stream could disturb the other consumer. Ending the utterance and
+      // letting the caller re-open is the safer recovery.
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
     // Boost the quiet panel mic so the orchestrator's energy-gate endpointer
     // registers speech (RMS floor ~700) and ends the utterance ~1 s after you
     // stop talking, instead of running to the safety cap. Saturating clamp so
@@ -577,6 +587,15 @@ bool WyomingSatellite::wake_session(int sock) {
 
   bool capturing = false;   // ADC open + audio-start sent
   bool muted_last = false;  // last mute state, to open/close on transitions
+  // Consecutive failed (zero-frame) mic reads. Drives the stall recovery
+  // below: reopen the capture after a short run, drop the session if even that
+  // doesn't restore it. At ~20 ms per failed read these are ~0.4 s and ~2 s —
+  // long enough not to fire on an incidental hiccup (a single reopen during a
+  // pipeline hand-off), short enough that a wedged stream self-heals quickly
+  // instead of staying dead until something else reconnects it.
+  int zero_reads = 0;
+  const int kZeroReadsBeforeReopen = 20;
+  const int kZeroReadsBeforeReconnect = 100;
   wake_detected_.store(false);
   EventDecoder decoder;
   uint8_t recv_buf[512];
@@ -654,7 +673,39 @@ bool WyomingSatellite::wake_session(int sock) {
       break;
     }
     size_t frames = audio_->record_pcm(buf, kChunkFrames);
-    if (frames == 0) continue;
+    if (frames == 0) {
+      // A zero read means the codec errored (or the handle was closed under
+      // us). Two reasons this must not be a bare `continue`:
+      //
+      // 1. No delay — a persistently failing read spins this task flat out.
+      // 2. No recovery — the driver's handle can be left open-but-dead (its
+      //    capturing_ stays true, so start_capture() is a refcount no-op and
+      //    nothing ever reopens it). Then EVERY later read fails too and the
+      //    wake stream is wedged until the session reconnects. Observed live:
+      //    chunks frozen at a fixed count for minutes with capturing=true and
+      //    connected=true, while the mic hardware was perfectly healthy.
+      //
+      // So: back off briefly, and after a short run of consecutive failures
+      // force a capture close+reopen to rebuild the handle. If reopening
+      // doesn't help either, drop the session — the reconnect path is the
+      // last resort that is known to recover it.
+      if (++zero_reads == kZeroReadsBeforeReopen) {
+        ESP_LOGW(kTag, "mic reads failing — reopening capture");
+        close_capture();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (!open_capture()) {
+          ok = false;
+          break;
+        }
+      } else if (zero_reads >= kZeroReadsBeforeReconnect) {
+        ESP_LOGE(kTag, "mic still dead after reopen — dropping wake session");
+        ok = false;
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    zero_reads = 0;  // a good read clears the failure run
     // Wake-only digital boost: the analog PGA alone leaves the MEMS mics too
     // quiet for openWakeWord's model. Scale here (with saturation) so the
     // stream, the peak gauge and the probe tee all reflect what the detector
@@ -829,12 +880,41 @@ void WyomingSatellite::wake_pcm_clear() {
 bool WyomingSatellite::probe_mic_levels(
     sensesp_cockpit_display::AudioDriver::MicLevels& out) {
   if (!audio_) return false;
-  // On-device wake holds the mic continuously; pause its feed so the probe is
-  // the sole reader (it re-opens the ADC), then resume regardless of outcome.
+  // The probe builds a SECOND codec device and opens it on the SHARED I2S RX,
+  // reconfiguring and then closing that RX. It must therefore be the SOLE mic
+  // reader while it runs: record_pcm() holds no lock across its blocking read
+  // (it can't — that would deadlock teardown), so a concurrent probe pulls the
+  // RX out from under it and leaves the capture handle open-but-dead. The
+  // driver's capturing_ stays true, so start_capture() is a refcount no-op and
+  // nothing reopens it — every later read fails and the stream never recovers.
+  //
+  // BOTH wake back-ends hold the mic continuously, so both must be released:
+  //
+  // - On-device: pause the engine's feed (it re-opens the ADC on resume).
+  // - Network: the wake loop owns the capture in wake_session(). It already
+  //   yields the mic for a pipeline, so reuse that gate — pipeline_active_
+  //   makes the loop close_capture() and idle. Previously only the on-device
+  //   branch was released, so on a network-wake panel the probe collided with
+  //   a live capture and wedged the wake stream (chunks frozen at a fixed
+  //   count with capturing=true, until the session reconnected).
   WakeEngine* e = config_.on_device_wake ? wake_engine_.load() : nullptr;
   if (e) e->pause();
+  const bool net_wake = !config_.on_device_wake;
+  if (net_wake) {
+    pipeline_active_.store(true);
+    // Wait for the loop to observe the gate and release the ADC. It polls at
+    // 20 ms; bound the wait so a stopped/disconnected wake loop (which never
+    // clears wake_capturing_) can't block the probe indefinitely.
+    const TickType_t kYieldTimeout = pdMS_TO_TICKS(300);
+    TickType_t t0 = xTaskGetTickCount();
+    while (wake_capturing_.load() &&
+           xTaskGetTickCount() - t0 < kYieldTimeout) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
   bool ok = audio_->probe_mic_channels(out);
   if (e) e->resume();
+  if (net_wake) pipeline_active_.store(false);
   return ok;
 }
 
