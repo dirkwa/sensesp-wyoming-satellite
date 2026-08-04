@@ -577,6 +577,15 @@ bool WyomingSatellite::wake_session(int sock) {
 
   bool capturing = false;   // ADC open + audio-start sent
   bool muted_last = false;  // last mute state, to open/close on transitions
+  // Consecutive failed (zero-frame) mic reads. Drives the stall recovery
+  // below: reopen the capture after a short run, drop the session if even that
+  // doesn't restore it. At ~20 ms per failed read these are ~0.4 s and ~2 s —
+  // long enough not to fire on an incidental hiccup (a single reopen during a
+  // pipeline hand-off), short enough that a wedged stream self-heals quickly
+  // instead of staying dead until something else reconnects it.
+  int zero_reads = 0;
+  const int kZeroReadsBeforeReopen = 20;
+  const int kZeroReadsBeforeReconnect = 100;
   wake_detected_.store(false);
   EventDecoder decoder;
   uint8_t recv_buf[512];
@@ -654,7 +663,39 @@ bool WyomingSatellite::wake_session(int sock) {
       break;
     }
     size_t frames = audio_->record_pcm(buf, kChunkFrames);
-    if (frames == 0) continue;
+    if (frames == 0) {
+      // A zero read means the codec errored (or the handle was closed under
+      // us). Two reasons this must not be a bare `continue`:
+      //
+      // 1. No delay — a persistently failing read spins this task flat out.
+      // 2. No recovery — the driver's handle can be left open-but-dead (its
+      //    capturing_ stays true, so start_capture() is a refcount no-op and
+      //    nothing ever reopens it). Then EVERY later read fails too and the
+      //    wake stream is wedged until the session reconnects. Observed live:
+      //    chunks frozen at a fixed count for minutes with capturing=true and
+      //    connected=true, while the mic hardware was perfectly healthy.
+      //
+      // So: back off briefly, and after a short run of consecutive failures
+      // force a capture close+reopen to rebuild the handle. If reopening
+      // doesn't help either, drop the session — the reconnect path is the
+      // last resort that is known to recover it.
+      if (++zero_reads == kZeroReadsBeforeReopen) {
+        ESP_LOGW(kTag, "mic reads failing — reopening capture");
+        close_capture();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (!open_capture()) {
+          ok = false;
+          break;
+        }
+      } else if (zero_reads >= kZeroReadsBeforeReconnect) {
+        ESP_LOGE(kTag, "mic still dead after reopen — dropping wake session");
+        ok = false;
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    zero_reads = 0;  // a good read clears the failure run
     // Wake-only digital boost: the analog PGA alone leaves the MEMS mics too
     // quiet for openWakeWord's model. Scale here (with saturation) so the
     // stream, the peak gauge and the probe tee all reflect what the detector
