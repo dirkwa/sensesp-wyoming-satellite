@@ -870,12 +870,41 @@ void WyomingSatellite::wake_pcm_clear() {
 bool WyomingSatellite::probe_mic_levels(
     sensesp_cockpit_display::AudioDriver::MicLevels& out) {
   if (!audio_) return false;
-  // On-device wake holds the mic continuously; pause its feed so the probe is
-  // the sole reader (it re-opens the ADC), then resume regardless of outcome.
+  // The probe builds a SECOND codec device and opens it on the SHARED I2S RX,
+  // reconfiguring and then closing that RX. It must therefore be the SOLE mic
+  // reader while it runs: record_pcm() holds no lock across its blocking read
+  // (it can't — that would deadlock teardown), so a concurrent probe pulls the
+  // RX out from under it and leaves the capture handle open-but-dead. The
+  // driver's capturing_ stays true, so start_capture() is a refcount no-op and
+  // nothing reopens it — every later read fails and the stream never recovers.
+  //
+  // BOTH wake back-ends hold the mic continuously, so both must be released:
+  //
+  // - On-device: pause the engine's feed (it re-opens the ADC on resume).
+  // - Network: the wake loop owns the capture in wake_session(). It already
+  //   yields the mic for a pipeline, so reuse that gate — pipeline_active_
+  //   makes the loop close_capture() and idle. Previously only the on-device
+  //   branch was released, so on a network-wake panel the probe collided with
+  //   a live capture and wedged the wake stream (chunks frozen at a fixed
+  //   count with capturing=true, until the session reconnected).
   WakeEngine* e = config_.on_device_wake ? wake_engine_.load() : nullptr;
   if (e) e->pause();
+  const bool net_wake = !config_.on_device_wake;
+  if (net_wake) {
+    pipeline_active_.store(true);
+    // Wait for the loop to observe the gate and release the ADC. It polls at
+    // 20 ms; bound the wait so a stopped/disconnected wake loop (which never
+    // clears wake_capturing_) can't block the probe indefinitely.
+    const TickType_t kYieldTimeout = pdMS_TO_TICKS(300);
+    TickType_t t0 = xTaskGetTickCount();
+    while (wake_capturing_.load() &&
+           xTaskGetTickCount() - t0 < kYieldTimeout) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
   bool ok = audio_->probe_mic_channels(out);
   if (e) e->resume();
+  if (net_wake) pipeline_active_.store(false);
   return ok;
 }
 
