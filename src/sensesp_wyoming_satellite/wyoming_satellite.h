@@ -173,6 +173,17 @@ class WyomingSatellite {
   // (guarded by probe_mutex_). NOTE: the probe ring is filled only by the
   // NETWORK wake path — on-device wake returns an empty snapshot.
   size_t wake_pcm_snapshot(int16_t* out, size_t max_samples);
+  // Milliseconds since the probe ring was last written, or UINT32_MAX if it has
+  // never been written. A caller MUST check this: the ring is only fed while
+  // the wake loop is actively streaming, so it goes stale (and keeps serving
+  // identical bytes) whenever capture stops. Anything above ~2000 ms means the
+  // samples are a frozen snapshot, not live audio.
+  uint32_t wake_pcm_age_ms() const;
+
+  // The audio driver this satellite captures through. Exposed so diagnostics
+  // (e.g. sweeping the mic preamp gain) can reach the HAL without a second
+  // global. Never null for a constructed satellite.
+  sensesp_cockpit_display::AudioDriver* audio() const { return audio_; }
   // Drop any retained mic PCM. Call when the mic is muted so /mic_probe can't
   // surface audio captured before the mute (privacy).
   void wake_pcm_clear();
@@ -288,6 +299,13 @@ class WyomingSatellite {
   int16_t* probe_buf_ = nullptr;      // lazily allocated on first capture
   size_t probe_head_ = 0;             // next write index
   size_t probe_filled_ = 0;           // valid samples (<= kProbeSamples)
+  // Tick when the ring was last WRITTEN. The ring is only fed from the wake
+  // loop's chunk path, so it FREEZES whenever capture stops (mid-pipeline, or
+  // any time the loop isn't streaming) and keeps returning its last contents
+  // forever. Without this a caller cannot tell live audio from a stale
+  // snapshot — /mic_probe silently served the same 2 s clip on 15 consecutive
+  // requests, which invalidated a whole afternoon of offline wake scoring.
+  std::atomic<uint32_t> probe_last_write_{0};
   SemaphoreHandle_t probe_mutex_ = nullptr;
   // Lock-free privacy kill switch: wake_pcm_clear() sets it so a snapshot
   // returns nothing IMMEDIATELY, even if it can't grab probe_mutex_ to zero

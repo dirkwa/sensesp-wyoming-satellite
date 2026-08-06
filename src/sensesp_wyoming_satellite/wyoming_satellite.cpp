@@ -747,6 +747,9 @@ bool WyomingSatellite::wake_session(int sock) {
           probe_filled_ = 0;
           probe_disabled_.store(false);
         }
+        // Stamp once per chunk so readers can tell live audio from a ring that
+        // froze when capture stopped (see wake_pcm_age_ms).
+        probe_last_write_.store((uint32_t)xTaskGetTickCount());
         for (size_t i = 0; i < frames; ++i) {
           probe_buf_[probe_head_] = buf[i];
           probe_head_ = (probe_head_ + 1) % kProbeSamples;
@@ -817,6 +820,12 @@ void WyomingSatellite::run_detection_pipeline() {
   }
   set_ptt_held(false);
   pipeline_active_.store(false);
+}
+
+uint32_t WyomingSatellite::wake_pcm_age_ms() const {
+  uint32_t t = probe_last_write_.load();
+  if (t == 0) return UINT32_MAX;  // never written
+  return (uint32_t)((xTaskGetTickCount() - t) * portTICK_PERIOD_MS);
 }
 
 size_t WyomingSatellite::wake_pcm_snapshot(int16_t* out, size_t max_samples) {
