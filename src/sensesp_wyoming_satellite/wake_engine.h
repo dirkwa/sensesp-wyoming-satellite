@@ -80,6 +80,9 @@ class WakeEngine {
   static void fetch_task_tramp(void* arg);
   void feed_loop();
   void fetch_loop();
+  // Start/stop the mic on the mono or 2ch handle per dual_mic_.
+  void capture_start();
+  void capture_stop();
 
   sensesp_cockpit_display::AudioDriver* audio_;
   DetectFn on_detect_;
@@ -90,6 +93,10 @@ class WakeEngine {
   void* afe_data_ = nullptr;     // esp_afe_sr_data_t*
   int feed_chunk_ = 0;           // samples per feed (per channel)
   int feed_channels_ = 1;
+  // True when AFE was created with format "MM" and the feed pulls the board's
+  // 2-channel [MIC1,MIC2] path (start_capture2/record_pcm2). Decided once at
+  // start() from audio_->supports_dual_mic(); the mono path is the fallback.
+  bool dual_mic_ = false;
   int input_gain_ = 1;
   float threshold_ = 0.0f;
   char word_[24] = "";
