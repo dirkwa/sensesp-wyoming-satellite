@@ -212,11 +212,14 @@ void WakeEngine::pause() {
 
 void WakeEngine::resume() {
   if (!running_.load() || !paused_.exchange(false)) return;
-  capture_start();
-  listening_.store(true);
-  // Re-arm WakeNet cleanly for the next word: reset the AFE input ring (drop
-  // any mid-pipeline fragment) and toggle wakenet off→on so its detection
-  // state doesn't stay latched from the word that just fired.
+  // Re-arm WakeNet BEFORE the feed loop is allowed back in. The feed task runs
+  // concurrently and resumes the moment paused_ is false; toggling wakenet
+  // off→on underneath a live feed() leaves the detector disabled (or
+  // half-initialised) for good, so the next word never scores. rearming_ holds
+  // the feed out for this window — paused_ is already false here, so it can't.
+  rearming_.store(true);
+  // Let the feed observe rearming_ and park before we touch the AFE.
+  vTaskDelay(pdMS_TO_TICKS(40));
   if (afe_data_ && afe_handle_) {
     const esp_afe_sr_iface_t* h = afe_if(afe_handle_);
     esp_afe_sr_data_t* d = afe_dat(afe_data_);
@@ -224,6 +227,9 @@ void WakeEngine::resume() {
     if (h->disable_wakenet) h->disable_wakenet(d);
     if (h->enable_wakenet) h->enable_wakenet(d);
   }
+  capture_start();
+  listening_.store(true);
+  rearming_.store(false);  // open the gate: WakeNet is armed and the mic is up
 }
 
 void WakeEngine::feed_task_tramp(void* arg) {
@@ -249,12 +255,15 @@ void WakeEngine::feed_loop() {
   size_t filled = 0;  // valid samples accumulated toward a full chunk
   bool parked_for_pause = false;
   while (running_.load()) {
+    // rearming_ keeps the feed out of the AFE while resume() resets the ring
+    // and toggles wakenet off→on. paused_ is already false by then, so it
+    // cannot hold this window on its own.
     const bool pausing = paused_.load();
-    if (pausing || (muted_fn_ && muted_fn_())) {
+    if (pausing || rearming_.load() || (muted_fn_ && muted_fn_())) {
       // Signal pause() ONCE per pause that the mic is now free. Do NOT give
-      // the token for a mute park — pause() must only unblock on a real pause,
-      // or a leftover mute token would let a later pause return while we're
-      // still mid-read.
+      // the token for a mute or re-arm park — pause() must only unblock on a
+      // real pause, or a leftover token would let a later pause return while
+      // we're still mid-read.
       if (pausing && !parked_for_pause) {
         parked_for_pause = true;
         if (feed_paused_) xSemaphoreGive(feed_paused_);
