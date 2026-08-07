@@ -211,12 +211,31 @@ void WakeEngine::pause() {
 }
 
 void WakeEngine::resume() {
-  if (!running_.load() || !paused_.exchange(false)) return;
-  capture_start();
-  listening_.store(true);
-  // Re-arm WakeNet cleanly for the next word: reset the AFE input ring (drop
-  // any mid-pipeline fragment) and toggle wakenet off→on so its detection
-  // state doesn't stay latched from the word that just fired.
+  if (!running_.load() || !paused_.load()) return;
+  // Re-arm WakeNet BEFORE the feed loop is allowed back in: toggling wakenet
+  // off→on underneath a live feed() leaves the detector disabled (or
+  // half-initialised) for good, so the next word never scores.
+  //
+  // Order is load-bearing. rearming_ must be raised BEFORE paused_ drops —
+  // otherwise there is a window where the feed sees both flags false, wakes up
+  // and re-enters record_pcm()/feed() exactly while we reset the AFE. The feed
+  // keeps parking on `paused_ || rearming_`, so it never becomes runnable
+  // between the two stores.
+  rearming_.store(true);
+  // Only the caller that owns the pause may release it — a concurrent resume()
+  // that lost the exchange must not clear rearming_ out from under the winner.
+  if (!paused_.exchange(false)) {
+    rearming_.store(false);
+    return;
+  }
+  // Wait for the feed to actually park before touching the AFE. It publishes
+  // feed_parked_ from the park branch, so this observes real quiescence rather
+  // than assuming a fixed delay is enough. Bounded: a feed blocked in a long
+  // record_pcm() must not wedge the resume path — re-arming a moment early is
+  // far better than never re-arming at all.
+  for (int i = 0; i < 40 && !feed_parked_.load(); i++) {
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
   if (afe_data_ && afe_handle_) {
     const esp_afe_sr_iface_t* h = afe_if(afe_handle_);
     esp_afe_sr_data_t* d = afe_dat(afe_data_);
@@ -224,6 +243,9 @@ void WakeEngine::resume() {
     if (h->disable_wakenet) h->disable_wakenet(d);
     if (h->enable_wakenet) h->enable_wakenet(d);
   }
+  capture_start();
+  listening_.store(true);
+  rearming_.store(false);  // open the gate: WakeNet is armed and the mic is up
 }
 
 void WakeEngine::feed_task_tramp(void* arg) {
@@ -249,21 +271,28 @@ void WakeEngine::feed_loop() {
   size_t filled = 0;  // valid samples accumulated toward a full chunk
   bool parked_for_pause = false;
   while (running_.load()) {
+    // rearming_ keeps the feed out of the AFE while resume() resets the ring
+    // and toggles wakenet off→on. paused_ is already false by then, so it
+    // cannot hold this window on its own.
     const bool pausing = paused_.load();
-    if (pausing || (muted_fn_ && muted_fn_())) {
+    if (pausing || rearming_.load() || (muted_fn_ && muted_fn_())) {
       // Signal pause() ONCE per pause that the mic is now free. Do NOT give
-      // the token for a mute park — pause() must only unblock on a real pause,
-      // or a leftover mute token would let a later pause return while we're
-      // still mid-read.
+      // the token for a mute or re-arm park — pause() must only unblock on a
+      // real pause, or a leftover token would let a later pause return while
+      // we're still mid-read.
       if (pausing && !parked_for_pause) {
         parked_for_pause = true;
         if (feed_paused_) xSemaphoreGive(feed_paused_);
       }
       if (!pausing) parked_for_pause = false;
       filled = 0;  // drop a partial chunk across a pause/mute gap
+      // Publish quiescence: we are demonstrably outside record_pcm()/feed()
+      // for as long as this branch keeps being taken.
+      feed_parked_.store(true);
       vTaskDelay(pdMS_TO_TICKS(30));
       continue;
     }
+    feed_parked_.store(false);
     parked_for_pause = false;
 
     // The engine owns the mic here — the ONLY capture caller while running and

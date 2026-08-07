@@ -117,6 +117,11 @@ class WakeEngine {
   std::atomic<bool> paused_{false};
   std::atomic<bool> listening_{false};
   std::atomic<uint32_t> detections_{0};
+  // Holds the feed loop out of the AFE while resume() re-arms WakeNet.
+  std::atomic<bool> rearming_{false};
+  // Published by feed_loop(): true while it is parked (not in record_pcm() or
+  // feed()). Lets resume() wait for real quiescence instead of sleeping.
+  std::atomic<bool> feed_parked_{false};
 
   // Diagnostic probe ring: the last ~2 s of post-gain PCM fed to WakeNet.
   static constexpr size_t kProbeSamples = 32000;  // 2 s @ 16 kHz
