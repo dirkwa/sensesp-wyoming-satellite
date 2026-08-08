@@ -71,6 +71,10 @@ class WakeEngine {
   // (post-gain) into `out` (up to max_samples), newest last. Returns the count
   // copied. Lets /mic_probe dump what the detector actually sees on-device.
   size_t pcm_snapshot(int16_t* out, size_t max_samples);
+  // Milliseconds since the probe ring was last written, or UINT32_MAX if it
+  // never has been. The ring keeps serving its last contents after the feed
+  // stops, so an age is the only way to tell live audio from a frozen buffer.
+  uint32_t pcm_age_ms() const;
   // Drop any retained probe PCM (privacy: called when the mic is muted). The
   // feed loop stops filling the ring while muted and clears it on this call.
   void clear_probe();
@@ -128,6 +132,10 @@ class WakeEngine {
   int16_t* probe_ = nullptr;
   size_t probe_head_ = 0;
   size_t probe_filled_ = 0;
+  // Tick of the last probe write, with a separate written-flag: tick 0 is a
+  // legitimate timestamp, so it cannot double as "never written".
+  std::atomic<uint32_t> probe_last_write_{0};
+  std::atomic<bool> probe_written_{false};
   SemaphoreHandle_t probe_mutex_ = nullptr;
   // Count of probe operations (pcm_snapshot / clear_probe) currently touching
   // probe_mutex_/probe_ from OTHER tasks (the /hello httpd path, the mic-mute
