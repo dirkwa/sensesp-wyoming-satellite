@@ -1,5 +1,6 @@
 #include "sensesp_wyoming_satellite/wake_engine.h"
 
+#include <cstdint>  // UINT32_MAX (pcm_age_ms)
 #include <cstdlib>
 #include <cstring>
 
@@ -184,6 +185,12 @@ size_t WakeEngine::pcm_snapshot(int16_t* out, size_t max_samples) {
   return n;
 }
 
+uint32_t WakeEngine::pcm_age_ms() const {
+  if (!probe_written_.load()) return UINT32_MAX;
+  uint32_t t = probe_last_write_.load();
+  return (uint32_t)((xTaskGetTickCount() - t) * portTICK_PERIOD_MS);
+}
+
 void WakeEngine::clear_probe() {
   // Same busy-guard as pcm_snapshot: this runs on the mic-mute widget task and
   // must not touch probe_mutex_/probe_ after stop() frees them.
@@ -329,6 +336,10 @@ void WakeEngine::feed_loop() {
     if (probe_mutex_ && xSemaphoreTake(probe_mutex_, 0) == pdTRUE) {
       if (!probe_) probe_ = (int16_t*)malloc(kProbeSamples * sizeof(int16_t));
       if (probe_) {
+        // Stamp every write so a caller can tell fresh PCM from a ring that froze
+        // when the feed stopped — the ring keeps serving its last contents.
+        probe_last_write_.store((uint32_t)xTaskGetTickCount());
+        probe_written_.store(true);
         for (int i = 0; i < feed_chunk_; i++) {
           probe_[probe_head_] = buf[i * feed_channels_];
           probe_head_ = (probe_head_ + 1) % kProbeSamples;

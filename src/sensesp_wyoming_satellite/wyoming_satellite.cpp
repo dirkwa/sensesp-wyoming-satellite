@@ -750,6 +750,7 @@ bool WyomingSatellite::wake_session(int sock) {
         // Stamp once per chunk so readers can tell live audio from a ring that
         // froze when capture stopped (see wake_pcm_age_ms).
         probe_last_write_.store((uint32_t)xTaskGetTickCount());
+        probe_written_.store(true);
         for (size_t i = 0; i < frames; ++i) {
           probe_buf_[probe_head_] = buf[i];
           probe_head_ = (probe_head_ + 1) % kProbeSamples;
@@ -823,8 +824,16 @@ void WyomingSatellite::run_detection_pipeline() {
 }
 
 uint32_t WyomingSatellite::wake_pcm_age_ms() const {
+  // Mirror wake_pcm_snapshot()'s backend choice: on-device wake fills the
+  // WakeEngine's own ring, so its age lives there. Reading the network ring's
+  // stamp on that path always reported "never written" while the snapshot
+  // returned real PCM — exactly backwards for a staleness check.
+  if (config_.on_device_wake) {
+    WakeEngine* e = wake_engine_.load();
+    return e ? e->pcm_age_ms() : UINT32_MAX;
+  }
+  if (!probe_written_.load()) return UINT32_MAX;
   uint32_t t = probe_last_write_.load();
-  if (t == 0) return UINT32_MAX;  // never written
   return (uint32_t)((xTaskGetTickCount() - t) * portTICK_PERIOD_MS);
 }
 

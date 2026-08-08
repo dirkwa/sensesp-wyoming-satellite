@@ -174,10 +174,12 @@ class WyomingSatellite {
   // NETWORK wake path — on-device wake returns an empty snapshot.
   size_t wake_pcm_snapshot(int16_t* out, size_t max_samples);
   // Milliseconds since the probe ring was last written, or UINT32_MAX if it has
-  // never been written. A caller MUST check this: the ring is only fed while
-  // the wake loop is actively streaming, so it goes stale (and keeps serving
-  // identical bytes) whenever capture stops. Anything above ~2000 ms means the
-  // samples are a frozen snapshot, not live audio.
+  // never been written. Reports whichever backend wake_pcm_snapshot() reads:
+  // the WakeEngine's ring on the on-device path, this class's ring on the
+  // network path. A caller MUST check this — a ring is only fed while its
+  // producer is capturing, so it goes stale (and keeps serving identical
+  // bytes) whenever capture stops. Anything above ~2000 ms means the samples
+  // are a frozen snapshot, not live audio.
   uint32_t wake_pcm_age_ms() const;
 
   // The audio driver this satellite captures through. Exposed so diagnostics
@@ -306,6 +308,9 @@ class WyomingSatellite {
   // snapshot — /mic_probe silently served the same 2 s clip on 15 consecutive
   // requests, which invalidated a whole afternoon of offline wake scoring.
   std::atomic<uint32_t> probe_last_write_{0};
+  // Separate written-flag: tick 0 is a legitimate timestamp, so it cannot
+  // double as a "never written" sentinel.
+  std::atomic<bool> probe_written_{false};
   SemaphoreHandle_t probe_mutex_ = nullptr;
   // Lock-free privacy kill switch: wake_pcm_clear() sets it so a snapshot
   // returns nothing IMMEDIATELY, even if it can't grab probe_mutex_ to zero
