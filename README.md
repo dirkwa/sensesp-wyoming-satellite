@@ -1,3 +1,23 @@
+> [!IMPORTANT]
+> **Archived — this library is no longer maintained.**
+>
+> The Wyoming voice satellite now lives in
+> [espOS](https://github.com/dirkwa/espOS) as two reusable ESP-IDF
+> components: **`espos_audio`** (the `AudioDriver` contract a board
+> implements) and **`espos_voice`** (protocol, TCP server, esp-sr
+> WakeNet engine). See
+> [docs/voice.md](https://github.com/dirkwa/espOS/blob/main/docs/voice.md).
+>
+> This library targets SensESP on PlatformIO. Everything using it moved
+> to ESP-IDF 6 on espOS, and the code was folded into
+> [espos-p4-cockpit](https://github.com/dirkwa/espos-p4-cockpit) during
+> that port. The two copies then diverged — the cockpit gained fixes this
+> one never received, including one for the wake fetch loop starving the
+> idle task on CPU 0. Rather than keep a third copy in sync, the code was
+> extracted into espOS so any espOS board can use it.
+>
+> Kept for history. Please do not build against it.
+
 # sensesp-wyoming-satellite
 
 Wyoming-protocol voice satellite for [SensESP](https://github.com/SignalK/SensESP):
